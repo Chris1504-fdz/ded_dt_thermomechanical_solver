@@ -6,6 +6,9 @@ from gamma.simulator.func import elastic_stiff_matrix,constitutive_problem,trans
 cp.cuda.Device(0).use()
 import pyvista as pv
 import vtk
+import cupyx.scipy.sparse as cusparse
+from cupyx.scipy.sparse import linalg as cusparse_linalg
+
 
 
 
@@ -40,7 +43,7 @@ def save_vtk(filename):
     
 domain = domain_mgr(filename='thinwall.k')
 heat_solver = heat_solve_mgr(domain)
-endtime = domain.end_time
+endtime = domain.end_sim_time
 n_n = len(domain.nodes)
 n_e = len(domain.elements)
 n_p = 8
@@ -89,24 +92,24 @@ filename = 'results/wall_{}.vtk'.format(file_num)
 save_vtk(filename)
 file_num = file_num + 1
 
-while domain.current_time<endtime-domain.dt:
+while domain.current_sim_time<endtime-domain.dt:
     t = t+1
     heat_solver.time_integration()
     if t % 5000 == 0:
         mempool = cp.get_default_memory_pool()
         mempool.free_all_blocks()
-        print("Current time:  {}, Percentage done:  {}%".format(domain.current_time,100*domain.current_time/domain.end_time))  
+        print("Current time:  {}, Percentage done:  {}%".format(domain.current_sim_time,100*domain.current_sim_time/domain.end_sim_time))  
         heat_solver.time_integration()
             
-    n_e_active = cp.sum(domain.element_birth < domain.current_time)
-    n_n_active = cp.sum(domain.node_birth < domain.current_time) 
+    n_e_active = cp.sum(domain.element_birth < domain.current_sim_time)
+    n_n_active = cp.sum(domain.node_birth < domain.current_sim_time) 
     
     if heat_solver.laser_state == 0 and n_e_active == n_e_old:
         implicit_timestep = 0.1
     else:
         implicit_timestep = 0.02
         
-    if domain.current_time >= last_mech_time + implicit_timestep:
+    if domain.current_sim_time >= last_mech_time + implicit_timestep:
         
 
         active_eles = domain.elements[0:n_e_active]
@@ -148,8 +151,26 @@ while domain.current_time<endtime-domain.dt:
                 #K_tangent = B.transpose()*(D_p)*B
                 n_plast = len(IND_p[IND_p])
                 print(' plastic integration points: ', n_plast, ' of ', IND_p.shape[0]*IND_p.shape[1])
-                F = B.transpose() @ ((ele_detJac[:,:,cp.newaxis].repeat(6,axis=2)*S).reshape(-1))
-                dU[Q],error = cusparse.linalg.cg(K_tangent[Q[0:n_n_active].flatten()][:,Q[0:n_n_active].flatten()],-F[Q[0:n_n_active].flatten()],tol=tol)
+                F_dof = B.transpose() @ ((ele_detJac[:, :, cp.newaxis].repeat(6, axis=2) * S).reshape(-1))
+                # active node count as Python int
+                n_n_active_i = int(n_n_active.item()) if hasattr(n_n_active, "item") else int(n_n_active)
+
+                # DOF mask for active, non-Dirichlet DOFs (length = 3*n_n_active_i)
+                mask = Q[:n_n_active_i, :].reshape(-1)
+                free = cp.where(mask)[0]   # integer indices (more robust than boolean indexing for assignment)
+
+                # Reduced linear system
+                A = K_tangent[free][:, free]
+                b = -F_dof[free]
+
+                x, info = cusparse_linalg.cg(A, b, tol=tol)
+
+                # Put solution back into full active DOF vector, then into (n_nodes,3)
+                dUv = cp.zeros(3 * n_n_active_i, dtype=F_dof.dtype)
+                dUv[free] = x
+                dU[:n_n_active_i, :] = dUv.reshape(n_n_active_i, 3)
+
+                error = info
                 U_new = U_it + beta*dU[0:n_n_active,:] 
                 q1 = beta**2*dU[0:n_n_active].flatten()@K_elast@dU[0:n_n_active].flatten()
                 q2 = U_it[0:n_n_active].flatten()@K_elast@U_it[0:n_n_active].flatten()
@@ -163,7 +184,7 @@ while domain.current_time<endtime-domain.dt:
                 U_it = cp.array(U_new) 
                 # test on the stopping criterion
                 if  criterion < tol:
-                    print('F = ', cp.linalg.norm(F[Q[0:n_n_active].flatten()]))
+                    print('F = ', cp.linalg.norm(F_dof[free]))
                     break
             else:
                 continue
@@ -180,8 +201,8 @@ while domain.current_time<endtime-domain.dt:
         Hard_prev[0:n_e_active] = Hard
         n_e_old = n_e_active
         n_n_old = n_n_active
-        last_mech_time = domain.current_time
-        if domain.current_time >= file_num*(output_timestep):
+        last_mech_time = domain.current_sim_time
+        if domain.current_sim_time >= file_num*(output_timestep):
             filename = 'results/wall_{}.vtk'.format(file_num)
             save_vtk(filename)
             file_num = file_num + 1
