@@ -12,7 +12,7 @@ import cupy as cp
 
 # Import your custom modules
 from laser_generator import LaserProfileGenerator
-from tm_wrapper import run_coupled_simulation
+from thermomechanical import run_coupled_simulation
 
 # --- CONFIGURATION ---
 N_INITIAL = 8           # Initial random simulations (will run in 2 batches of 4)
@@ -29,29 +29,29 @@ PROPERTIES_DIR = "../0_properties"
 GEOM_FILE = "thinwall.k"
 
 def simulation_worker(gpu_id, params, sim_duration, properties_dir, geom_file):
-    """
-    This function runs in a separate process for each GPU.
-    """
+    import gc # Import inside worker
     try:
-        # Set the specific GPU for this process
         with cp.cuda.Device(gpu_id):
             generator = LaserProfileGenerator(total_time=sim_duration)
             
-            iteration_label = f"gpu{gpu_id}_sim_{np.random.randint(0, 1e6)}"
+            # Use a deterministic label for debugging
+            iteration_label = f"gpu{gpu_id}_{time.time()}"
             zarr_path = f"stress_history_{iteration_label}.zarr"
             
-            max_residual_stress = run_coupled_simulation(
+            val = run_coupled_simulation(
                 params=params,
                 generator=generator,
                 input_dir=properties_dir,
                 geom_file=geom_file,
                 output_path=zarr_path
             )
-            # We want to MINIMIZE stress, so return negative
-            return -max_residual_stress
+            
+            # Cleanup GPU memory explicitly before exiting process
+            cp.get_default_memory_pool().free_all_blocks()
+            return -float(val)
     except Exception as e:
-        print(f"Simulation failed on GPU {gpu_id}: {e}")
-        return -99999.0
+        print(f"CRITICAL: GPU {gpu_id} failed: {e}")
+        return None # Handle as NaN in the main loop
 
 def evaluate_batch_parallel(candidates_tensor):
     """
