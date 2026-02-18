@@ -153,23 +153,42 @@ while domain.current_sim_time<endtime-domain.dt:
                 S, DS, IND_p,_,_ = constitutive_problem(E[0:n_e_active], Ep_prev[0:n_e_active], Hard_prev[0:n_e_active], shear[0:n_e_active], bulk[0:n_e_active], a[0:n_e_active], Y[0:n_e_active])
                 vD = ele_detJac[:,:,cp.newaxis,cp.newaxis].repeat(6,axis=2).repeat(6,axis=3) * DS
                 D_p = cusparse.csr_matrix((cp.ndarray.flatten(vD), (cp.ndarray.flatten(iD),cp.ndarray.flatten(jD))), shape = D_elast.shape, dtype = cp.float_)
-                # K_tangent = K_elast + B.transpose()*(D_p-D_elast)*B
-                K_tangent = B.transpose()*(D_p)*B
+                
                 n_plast = len(IND_p[IND_p])
                 print(' plastic integration points: ', n_plast, ' of ', IND_p.shape[0]*IND_p.shape[1])
                 F_dof = B.transpose() @ ((ele_detJac[:, :, cp.newaxis].repeat(6, axis=2) * S).reshape(-1))
-                # active node count as Python int
+                
                 n_n_active_i = int(n_n_active.item()) if hasattr(n_n_active, "item") else int(n_n_active)
-
-                # DOF mask for active, non-Dirichlet DOFs (length = 3*n_n_active_i)
                 mask = Q[:n_n_active_i, :].reshape(-1)
-                free = cp.where(mask)[0]   # integer indices (more robust than boolean indexing for assignment)
-
-                # Reduced linear system
-                A = K_tangent[free][:, free]
+                free = cp.where(mask)[0]   
                 b = -F_dof[free]
 
-                x, info = cusparse_linalg.cg(A, b, rtol=tol)
+                # --- THE ULTIMATE MATRIX-FREE TRICK ---
+                from cupyx.scipy.sparse.linalg import LinearOperator
+                
+                def matvec_free(v_free):
+                    v_full = cp.zeros(3 * n_n_active_i, dtype=v_free.dtype)
+                    v_full[free] = v_free
+                    
+                    # K_tangent * v  =  B^T * D_p * B * v
+                    temp1 = B.dot(v_full)
+                    temp2 = D_p.dot(temp1)
+                    res_full = B.transpose().dot(temp2)
+                    
+                    res_free = res_full[free]
+                    
+                    # Force immediate memory recycling
+                    del v_full, temp1, temp2, res_full
+                    return res_free
+                
+                n_free = len(free)
+                A_op = LinearOperator((n_free, n_free), matvec=matvec_free)
+
+                # Pass the LinearOperator directly into the CG solver
+                x, info = cusparse_linalg.cg(A_op, b, rtol=tol)
+                
+                # Aggressively delete SpGEMM hazards
+                del D_p, A_op
 
                 # Put solution back into full active DOF vector, then into (n_nodes,3)
                 dUv = cp.zeros(3 * n_n_active_i, dtype=F_dof.dtype)
