@@ -1,15 +1,21 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import cupy as cp
 import numpy as np
 import cupyx.scipy.sparse as cusparse
 from gamma.simulator.gamma import domain_mgr, heat_solve_mgr
 from gamma.simulator.func import elastic_stiff_matrix,constitutive_problem,transformation,disp_match
-cp.cuda.Device(0).use()
 import pyvista as pv
 import vtk
 import cupyx.scipy.sparse as cusparse
 from cupyx.scipy.sparse import linalg as cusparse_linalg
 
+cp.cuda.Device(0).use()
 
+def compute_energy(vec):
+    strain = B.dot(vec)
+    stress = D_elast.dot(strain)
+    return strain.dot(stress)
 
 
 def save_vtk(filename):
@@ -147,8 +153,8 @@ while domain.current_sim_time<endtime-domain.dt:
                 S, DS, IND_p,_,_ = constitutive_problem(E[0:n_e_active], Ep_prev[0:n_e_active], Hard_prev[0:n_e_active], shear[0:n_e_active], bulk[0:n_e_active], a[0:n_e_active], Y[0:n_e_active])
                 vD = ele_detJac[:,:,cp.newaxis,cp.newaxis].repeat(6,axis=2).repeat(6,axis=3) * DS
                 D_p = cusparse.csr_matrix((cp.ndarray.flatten(vD), (cp.ndarray.flatten(iD),cp.ndarray.flatten(jD))), shape = D_elast.shape, dtype = cp.float_)
-                K_tangent = K_elast + B.transpose()*(D_p-D_elast)*B
-                #K_tangent = B.transpose()*(D_p)*B
+                # K_tangent = K_elast + B.transpose()*(D_p-D_elast)*B
+                K_tangent = B.transpose()*(D_p)*B
                 n_plast = len(IND_p[IND_p])
                 print(' plastic integration points: ', n_plast, ' of ', IND_p.shape[0]*IND_p.shape[1])
                 F_dof = B.transpose() @ ((ele_detJac[:, :, cp.newaxis].repeat(6, axis=2) * S).reshape(-1))
@@ -163,7 +169,7 @@ while domain.current_sim_time<endtime-domain.dt:
                 A = K_tangent[free][:, free]
                 b = -F_dof[free]
 
-                x, info = cusparse_linalg.cg(A, b, tol=tol)
+                x, info = cusparse_linalg.cg(A, b, rtol=tol)
 
                 # Put solution back into full active DOF vector, then into (n_nodes,3)
                 dUv = cp.zeros(3 * n_n_active_i, dtype=F_dof.dtype)
@@ -172,9 +178,10 @@ while domain.current_sim_time<endtime-domain.dt:
 
                 error = info
                 U_new = U_it + beta*dU[0:n_n_active,:] 
-                q1 = beta**2*dU[0:n_n_active].flatten()@K_elast@dU[0:n_n_active].flatten()
-                q2 = U_it[0:n_n_active].flatten()@K_elast@U_it[0:n_n_active].flatten()
-                q3 = U_new[0:n_n_active].flatten()@K_elast@U_new[0:n_n_active].flatten()
+
+                q1 = beta**2 * compute_energy(dU[0:n_n_active].flatten())
+                q2 = compute_energy(U_it.flatten())
+                q3 = compute_energy(U_new.flatten())
                 if q2 == 0 and q3 == 0:
                     criterion = 0
                 else:

@@ -16,6 +16,16 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
+dependencies = [
+    "botorch>=0.16.1",
+    "cupy-cuda12x>=14.0.0",
+    "ipykernel>=7.2.0",
+    "numba>=0.63.1",
+    "pandas>=2.3.3",
+    "pytest>=9.0.2",
+    "pyvista>=0.47.0",
+    "zarr>=2.18.3",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/ShuhengLiao/AM_Thermomechanical_Solver"
