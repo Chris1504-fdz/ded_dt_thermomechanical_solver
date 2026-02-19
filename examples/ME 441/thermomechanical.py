@@ -69,6 +69,12 @@ class DEDSimulator:
         """
         # Interpolate Properties
         young = cp.interp(temp_ip, self.temp_young1, self.young1)
+        
+        # --- CRITICAL FIX 1: STIFFNESS FLOOR ---
+        # Prevent molten metal from creating a singular matrix (infinite CG loops)
+        E_min = float(cp.max(self.young1)) * 1e-4
+        young = cp.clip(young, a_min=E_min, a_max=None)
+        
         shear = young / (2 * (1 + self.poisson))
         bulk = young / (3 * (1 - 2 * self.poisson))
         Y = cp.interp(temp_ip, self.temp_Y1, self.Y1)
@@ -101,6 +107,17 @@ class DEDSimulator:
                 b = -F_dof[free]
 
                 # 4. Matrix-Free CG Solver
+                # 4. Matrix-Free CG Solver
+                it_count = 0
+                def monitor(xk):
+                    nonlocal it_count
+                    it_count += 1
+                    if it_count % 500 == 0:
+                        # Calculate residual manually only when printing to save GPU time
+                        # residual = ||b - A*x|| / ||b||
+                        current_res = cp.linalg.norm(b - A_op.matvec(xk)) / (cp.linalg.norm(b) + 1e-12)
+                        print(f"      [CG Iter {it_count}] Rel. Residual: {float(current_res):.2e}", flush=True)
+
                 def matvec_free(v_free):
                     v_full = cp.zeros(3 * n_n_active, dtype=v_free.dtype)
                     v_full[free] = v_free
@@ -112,8 +129,15 @@ class DEDSimulator:
                     return res_free
 
                 A_op = LinearOperator((len(free), len(free)), matvec=matvec_free)
-                x, info = cusparse_linalg.cg(A_op, b, rtol=self.tol)
                 
+                # --- CRITICAL FIX 2: CG LIMITS & CALLBACK ---
+                x, info = cusparse_linalg.cg(A_op, b, rtol=self.tol, maxiter=3000, callback=monitor)
+                
+                if info > 0:
+                    print(f"    !!! CG hit maxiter (3000) without reaching tolerance.", flush=True)
+                elif info < 0:
+                    print(f"    !!! CG failed with mathematical breakdown.", flush=True)
+
                 # 5. Corrector
                 dUv = cp.zeros(3 * n_n_active, dtype=F_dof.dtype)
                 dUv[free] = x
@@ -148,9 +172,11 @@ class DEDSimulator:
 
     def run(self, params, generator):
         """Executes the coupled time loop."""
+        print(f"Step 1: Loading domain and toolpath...", flush=True)
         self.domain = domain_mgr(filename=self.geom_file, input_data_dir=self.input_dir, verbose=True)
         self.heat_solver = heat_solve_mgr(self.domain)
         
+        print(f"Step 2: Preparing material arrays...", flush=True)
         self._load_materials()
         self._init_state_arrays()
         generator.generate_profile(params)
@@ -164,7 +190,7 @@ class DEDSimulator:
         last_mech_time = 0
         K_elast, B, D_elast, iD, jD, ele_detJac = None, None, None, None, None, None
         
-        print(f"Starting Simulation Loop (Total Time: {self.domain.end_sim_time}s)...")
+        print(f"Starting Simulation Loop (Total Time: {self.domain.end_sim_time}s)...", flush=True)
         
         while self.domain.current_sim_time < self.domain.end_sim_time - self.domain.dt:
             # Thermal Step
@@ -172,6 +198,11 @@ class DEDSimulator:
             self.heat_solver.q_in = current_power * self.domain.absortivity
             self.heat_solver.time_integration()
             
+            # --- THERMAL HEARTBEAT ---
+            if self.heat_solver.current_step % 2000 == 0:
+                progress = (self.domain.current_sim_time / self.domain.end_sim_time) * 100
+                print(f"  [Thermal] Time: {self.domain.current_sim_time:.3f}s / {self.domain.end_sim_time}s ({progress:.1f}%)", flush=True)
+
             n_e_active = int(cp.sum(self.domain.element_birth < self.domain.current_sim_time))
             n_n_active = int(cp.sum(self.domain.node_birth < self.domain.current_sim_time))
             
@@ -179,24 +210,37 @@ class DEDSimulator:
             
             # Mechanical Step
             if self.domain.current_sim_time >= last_mech_time + implicit_timestep:
+                # --- MECHANICAL HEARTBEAT ---
+                print(f"  >>> MECHANICAL SOLVE: Time {self.domain.current_sim_time:.3f}s | Active Eles: {n_e_active}", flush=True)
+
                 cp.get_default_memory_pool().free_all_blocks()
                 
-                active_eles = self.domain.elements[0:n_e_active]
-                active_nodes = self.domain.nodes[0:n_n_active]
+                # --- CRITICAL FIX 3: Cast element/node arrays to GPU before applying masks ---
+                elements_gpu = cp.asarray(self.domain.elements)
+                nodes_gpu = cp.asarray(self.domain.nodes)
+                
+                active_eles = elements_gpu[0:n_e_active]
+                active_nodes = nodes_gpu[0:n_n_active]
                 
                 if n_n_active > n_n_old:
                     self.U = disp_match(self.domain.nodes, self.U, n_n_old, self.domain.nN)
                     
-                temp_ip = (self.domain.Nip_ele[:,cp.newaxis,:] @ self.heat_solver.temperature[self.domain.elements][:,cp.newaxis,:,cp.newaxis].repeat(8,axis=1))[:,:,0,0]
+                temp_ip = (self.domain.Nip_ele[:,cp.newaxis,:] @ self.heat_solver.temperature[elements_gpu][:,cp.newaxis,:,cp.newaxis].repeat(8,axis=1))[:,:,0,0]
                 temp_ip = cp.clip(temp_ip, 300, 2300)
                 
                 if n_e_active > n_e_old or K_elast is None:
                     del K_elast, B, D_elast
                     cp.get_default_memory_pool().free_all_blocks()
-                    # Recompute base stiffness tensors (Requires youngs/shear baseline)
+                    # Recompute base stiffness tensors 
                     young_base = cp.interp(temp_ip, self.temp_young1, self.young1)
+                    
+                    # Apply stiffness floor to baseline as well
+                    E_min_base = float(cp.max(self.young1)) * 1e-4
+                    young_base = cp.clip(young_base, a_min=E_min_base, a_max=None)
+                    
                     shear_base = young_base / (2*(1+self.poisson))
                     bulk_base = young_base / (3*(1-2*self.poisson))
+                    
                     K_elast, B, D_elast, _, _, iD, jD, ele_detJac = elastic_stiff_matrix(
                         active_eles, active_nodes, self.domain.Bip_ele, shear_base[0:n_e_active], bulk_base[0:n_e_active]
                     )
@@ -242,7 +286,7 @@ def run_coupled_simulation(params, generator, input_dir="../0_properties", geom_
         return objective
     finally:
         # Guarantee massive GPU arrays are wiped out even if the simulation crashes
-        print("Cleaning up GPU memory...")
+        print("Cleaning up GPU memory...", flush=True)
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
