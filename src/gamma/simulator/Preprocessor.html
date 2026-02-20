@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gamma Preprocessor Documentation</title>
+    <style>
+        :root {
+            --primary-color: #2c3e50;
+            --accent-color: #e74c3c; /* Different accent color for Preprocessor */
+            --text-color: #333;
+            --bg-color: #f9f9fb;
+            --sidebar-width: 280px;
+            --code-bg: #f4f6f8;
+            --border-color: #eaecef;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+            line-height: 1.6;
+            color: var(--text-color);
+            background-color: var(--bg-color);
+            margin: 0;
+            display: flex;
+        }
+
+        /* Sidebar Navigation */
+        nav {
+            width: var(--sidebar-width);
+            height: 100vh;
+            background: white;
+            border-right: 1px solid var(--border-color);
+            position: fixed;
+            top: 0;
+            left: 0;
+            overflow-y: auto;
+            padding: 2rem 1.5rem;
+            box-sizing: border-box;
+        }
+
+        nav h3 {
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #7f8c8d;
+            margin-bottom: 1rem;
+            margin-top: 2rem;
+        }
+
+        nav h3:first-child {
+            margin-top: 0;
+        }
+
+        nav ul {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        nav li {
+            margin-bottom: 0.5rem;
+        }
+
+        nav a {
+            text-decoration: none;
+            color: var(--primary-color);
+            font-size: 0.95rem;
+            display: block;
+            padding: 0.4rem 0.5rem;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+
+        nav a:hover {
+            background-color: #fdedec;
+            color: var(--accent-color);
+        }
+
+        /* Main Content */
+        main {
+            margin-left: var(--sidebar-width);
+            padding: 4rem 6rem;
+            max-width: 900px;
+            width: 100%;
+            background: white;
+            min-height: 100vh;
+        }
+
+        h1, h2, h3, h4 {
+            color: var(--primary-color);
+            font-weight: 600;
+        }
+
+        h1 { font-size: 2.5rem; border-bottom: 1px solid var(--border-color); padding-bottom: 1rem; margin-bottom: 2rem; }
+        h2 { font-size: 1.8rem; margin-top: 3rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem; }
+        h3 { font-size: 1.4rem; margin-top: 2rem; }
+        h4 { font-size: 1.1rem; margin-top: 1.5rem; color: #555; }
+
+        p { margin-bottom: 1rem; }
+
+        /* Code Blocks */
+        pre {
+            background-color: var(--code-bg);
+            padding: 1rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            border: 1px solid var(--border-color);
+            font-size: 0.9rem;
+        }
+
+        code {
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+            background-color: rgba(27, 31, 35, 0.05);
+            padding: 0.2em 0.4em;
+            border-radius: 3px;
+            font-size: 85%;
+        }
+
+        pre code {
+            background-color: transparent;
+            padding: 0;
+            font-size: 100%;
+        }
+
+        /* Parameter Lists */
+        ul.params {
+            list-style: none;
+            padding: 0;
+        }
+
+        ul.params li {
+            margin-bottom: 1rem;
+            padding-left: 1rem;
+            border-left: 3px solid var(--accent-color);
+        }
+
+        strong.param-name {
+            color: var(--primary-color);
+            font-family: monospace;
+            font-size: 1.1em;
+        }
+
+        em.param-type {
+            color: #7f8c8d;
+            font-size: 0.9em;
+            margin-left: 0.5rem;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            body { flex-direction: column; }
+            nav { width: 100%; height: auto; position: relative; border-right: none; border-bottom: 1px solid var(--border-color); }
+            main { margin-left: 0; padding: 2rem; }
+        }
+    </style>
+</head>
+<body>
+
+    <nav>
+        <h3>Gamma Preprocessor</h3>
+        <ul>
+            <li><a href="#intro">Overview</a></li>
+        </ul>
+        
+        <h3>Mesh Processing</h3>
+        <ul>
+            <li><a href="#write-keywords">write_keywords</a></li>
+            <li><a href="#load-mesh">load_mesh_file</a></li>
+        </ul>
+
+        <h3>Element Activation</h3>
+        <ul>
+            <li><a href="#write-birth">write_birth</a></li>
+            <li><a href="#assign-birth">assign_birth_time (JIT)</a></li>
+        </ul>
+
+        <h3>Solver Config</h3>
+        <ul>
+            <li><a href="#write-parameters">write_parameters</a></li>
+            <li><a href="#load-toolpath">load_toolpath</a></li>
+        </ul>
+    </nav>
+
+    <main>
+        <section id="intro">
+            <h1>Gamma Preprocessor Documentation</h1>
+            <p><strong>Module:</strong> <code>gamma.preprocessor</code></p>
+            <p>This module handles the ingestion of raw mesh data and toolpath files to generate the formatted input files required by the Gamma solver. It includes logic for calculating element activation times ("element birth") based on laser trajectory and visualizing the deposition process.</p>
+        </section>
+
+        <section id="mesh-processing">
+            <h2>Mesh Processing</h2>
+            <p>Functions for reading raw geometry files and formatting them into LS-DYNA-style keyword inputs.</p>
+
+            <h3 id="write-keywords"><code>write_keywords(file_name, output_file, height)</code></h3>
+            <p>Reads a raw input file, segmenting nodes and elements, and rewriting them into a structured format. It automatically assigns Part IDs based on Z-height to distinguish between the <strong>Substrate</strong> and the <strong>Build</strong>.</p>
+            
+            <h4>Parameters</h4>
+            <ul class="params">
+                <li>
+                    <div><strong class="param-name">file_name</strong> <em class="param-type">(str)</em></div>
+                    Path to the raw input mesh file.
+                </li>
+                <li>
+                    <div><strong class="param-name">output_file</strong> <em class="param-type">(str)</em></div>
+                    Path where the formatted <code>.k</code> file will be written.
+                </li>
+                <li>
+                    <div><strong class="param-name">height</strong> <em class="param-type">(float)</em></div>
+                    The Z-height threshold. Nodes/Elements above this height are classified as "Build" (Part ID 1), and below are "Substrate" (Part ID 2).
+                </li>
+            </ul>
+            <h4>Generated Sets</h4>
+            <ul>
+                <li><strong>Node Set 1:</strong> All nodes.</li>
+                <li><strong>Node Set 2:</strong> Nodes where <code>z >= height</code> (The Build).</li>
+                <li><strong>Node Set 3:</strong> Nodes where <code>z == 0</code> (The Base/Clamped surface).</li>
+            </ul>
+
+            <h3 id="load-mesh"><code>load_mesh_file(filename)</code></h3>
+            <p>Parses a formatted <code>.k</code> file to extract numerical node and element data.</p>
+            <h4>Returns</h4>
+            <ul class="params">
+                <li>
+                    <div><strong class="param-name">nodes</strong> <em class="param-type">(np.array)</em></div>
+                    An array of shape <code>(N, 3)</code> containing [x, y, z] coordinates.
+                </li>
+                <li>
+                    <div><strong class="param-name">elements</strong> <em class="param-type">(np.array)</em></div>
+                    An array of shape <code>(M, 8)</code> containing the 8-node connectivity list for hexahedral elements. Indices are 0-based relative to the node list.
+                </li>
+            </ul>
+        </section>
+
+        <section id="element-activation">
+            <h2>Element Activation (Birth)</h2>
+            <p>Logic for determining when elements physically appear in the simulation based on the laser toolpath.</p>
+
+            <h3 id="write-birth"><code>write_birth(...)</code></h3>
+<pre><code>write_birth(output_file, toolpath_file, path_resolution, radius,
+            gif_start=0, gif_end=-1, nFrame=200, mode=0, ...)</code></pre>
+            <p>The master orchestration function for element birth. It:</p>
+            <ol>
+                <li>Loads the mesh and toolpath.</li>
+                <li>Calculates birth times for every element using <code>assign_birth_time</code>.</li>
+                <li>Generates a 3D visualization GIF (<code>birth.gif</code>) of the printing process using PyVista.</li>
+                <li>Appends a <code>*DEFINE_CURVE</code> keyword to the output file, mapping Element IDs to their Birth Times.</li>
+            </ol>
+
+            <h3 id="assign-birth"><code>assign_birth_time(...)</code></h3>
+            <p><strong>Decorators:</strong> <code>@jit(nopython=True)</code></p>
+            <p>A high-performance Numba kernel that iterates through the toolpath and elements to calculate activation times.</p>
+            
+            <h4>Parameters</h4>
+            <ul class="params">
+                <li>
+                    <div><strong class="param-name">ele_nodes / ele_ctrl / ele_topz</strong> <em class="param-type">(np.array)</em></div>
+                    Pre-calculated geometric properties of the elements (nodes, centroids, max-z).
+                </li>
+                <li>
+                    <div><strong class="param-name">toolpath</strong> <em class="param-type">(np.array)</em></div>
+                    The parsed toolpath data [time, x, y, z, state].
+                </li>
+                <li>
+                    <div><strong class="param-name">radius</strong> <em class="param-type">(float)</em></div>
+                    The laser/deposition radius. Elements within this radius of the toolpath vector are activated.
+                </li>
+                <li>
+                    <div><strong class="param-name">mode</strong> <em class="param-type">(int)</em></div>
+                    <strong>0:</strong> Standard distance check (Spherical activation).<br>
+                    <strong>1:</strong> Flat head check (Cylindrical activation).<br>
+                    <strong>2:</strong> No birth (All elements active from t=0).
+                </li>
+            </ul>
+        </section>
+
+        <section id="solver-config">
+            <h2>Solver Configuration</h2>
+            <p>Utilities for setting up the physics definitions.</p>
+
+            <h3 id="write-parameters"><code>write_parameters(output_file)</code></h3>
+            <p>Prepends the static physics definition block to the <code>output_file</code>. This includes standard LS-DYNA keywords required for the Gamma solver to function.</p>
+            <h4>Key Definitions Written:</h4>
+            <ul>
+                <li><code>*PARAMETER</code>: Boltzmann constant, Ambient temp, Absolute zero.</li>
+                <li><code>*MAT_THERMAL_ISOTROPIC</code>: Material definitions for Substrate and Build (placeholder placeholders for density, solidus, liquidus, etc.).</li>
+                <li><code>*CONTROL_TIMESTEP</code>: Solver time-stepping controls.</li>
+                <li><code>*INITIAL_TEMPERATURE_SET</code>: Sets initial global temperature to 300K.</li>
+            </ul>
+
+            <h3 id="load-toolpath"><code>load_toolpath(filename)</code></h3>
+            <p>Reads a space-delimited toolpath file.</p>
+            <h4>Expected Format</h4>
+            <p>Columns: <code>[time, x, y, z, state]</code></p>
+            <ul>
+                <li><strong>state:</strong> 0 = Laser Off (Travel), 1 = Laser On (Deposition).</li>
+            </ul>
+        </section>
+    </main>
+</body>
+</html>

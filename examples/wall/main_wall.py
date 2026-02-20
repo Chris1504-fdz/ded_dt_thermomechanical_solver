@@ -1,21 +1,25 @@
+import sys
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+sys.path.append('../../includes')
 import cupy as cp
 import numpy as np
+from cupyx import scatter_add
 import cupyx.scipy.sparse as cusparse
+import cupyx.scipy.sparse.linalg as cusparse_linalg
+import pandas as pd
+import time
+from gamma.simulator.preprocessor import write_keywords,write_birth,write_parameters
 from gamma.simulator.gamma import domain_mgr, heat_solve_mgr
 from gamma.simulator.func import elastic_stiff_matrix,constitutive_problem,transformation,disp_match
 cp.cuda.Device(0).use()
 import pyvista as pv
 import vtk
-import cupyx.scipy.sparse as cusparse
-from cupyx.scipy.sparse import linalg as cusparse_linalg
-
-
-
 
 def save_vtk(filename):
-    n_e_save = cp.sum(domain.active_elements)
-    n_n_save = cp.sum(domain.active_nodes)
-    active_elements = domain.elements[domain.active_elements].tolist()
+    n_e_save = int(cp.sum(domain.active_elements))
+    n_n_save = int(cp.sum(domain.active_nodes))
+    active_elements = domain.elements[domain.active_elements.get()].tolist()
     active_cells = np.array([item for sublist in active_elements for item in [8] + sublist])
     active_cell_type = np.array([vtk.VTK_HEXAHEDRON] * len(active_elements))
     points = domain.nodes[0:n_n_save].get() + 5*U[0:n_n_save].get()
@@ -69,7 +73,7 @@ Ep_prev = cp.zeros((n_e,n_q,6))                  # plastic strain tensors at int
 Hard_prev = cp.zeros((n_e,n_q,6))
 U = cp.zeros((n_n,3))
 dU = cp.zeros((n_n,3))
-F = cp.zeros((n_n,3))
+F_ext = cp.zeros((n_n,3))
 f = cp.zeros((n_n,3))
 alpha_Th = cp.zeros((n_e,n_q,6))
 idirich = cp.array(domain.nodes[:, 2] == -4.0 ) 
@@ -110,7 +114,6 @@ while domain.current_sim_time<endtime-domain.dt:
         implicit_timestep = 0.02
         
     if domain.current_sim_time >= last_mech_time + implicit_timestep:
-        
 
         active_eles = domain.elements[0:n_e_active]
         active_nodes = domain.nodes[0:n_n_active]
@@ -118,7 +121,6 @@ while domain.current_sim_time<endtime-domain.dt:
         if n_n_active>n_n_old:
             if domain.nodes[n_n_old:n_n_active,2].max()>domain.nodes[0:n_n_old,2].max():
                 U = disp_match(domain.nodes, U, n_n_old, n_n)
-        
         
         temperature_nodes = heat_solver.temperature[domain.elements]
         temperature_ip = (domain.Nip_ele[:,cp.newaxis,:]@temperature_nodes[:,cp.newaxis,:,cp.newaxis].repeat(8,axis=1))[:,:,0,0]
@@ -129,6 +131,7 @@ while domain.current_sim_time<endtime-domain.dt:
         Q[idirich,:] = 0
         
         young = cp.interp(temperature_ip,temp_young1,young1)
+        
         shear = young/(2*(1+poisson))        # shear modulus
         bulk = young/(3*(1-2*poisson))       # bulk modulus
         scl = cp.interp(temperature_ip,temp_scl1,scl1)
@@ -136,7 +139,8 @@ while domain.current_sim_time<endtime-domain.dt:
         alpha_Th[:,:,0:3] = scl[:,:,cp.newaxis].repeat(3,axis=2)
         Y = cp.interp(temperature_ip,temp_Y1,Y1)
         
-        K_elast,B,D_elast,ele_B,ele_D,iD,jD,ele_detJac = elastic_stiff_matrix(active_eles,active_nodes,domain.Bip_ele, shear[0:n_e_active], bulk[0:n_e_active])
+        # K_elast returns as None from our updated func.py
+        K_elast,B,D_elast,ele_B,ele_D,iD,jD,ele_detJac_active = elastic_stiff_matrix(active_eles,active_nodes,domain.Bip_ele, shear[0:n_e_active], bulk[0:n_e_active])
     
         for beta in [1.0,0.5,0.3,0.1]:
             U_it = U[0:n_n_active]
@@ -144,37 +148,45 @@ while domain.current_sim_time<endtime-domain.dt:
                 E[0:n_e_active] = cp.reshape(B@U_it.flatten(),(-1,8,6))
                 E[0:n_e_active] = E[0:n_e_active] - (temperature_ip[0:n_e_active,:,cp.newaxis].repeat(6,axis=2) - T_Ref) *alpha_Th[0:n_e_active]
 
-                S, DS, IND_p,_,_ = constitutive_problem(E[0:n_e_active], Ep_prev[0:n_e_active], Hard_prev[0:n_e_active], shear[0:n_e_active], bulk[0:n_e_active], a[0:n_e_active], Y[0:n_e_active])
-                vD = ele_detJac[:,:,cp.newaxis,cp.newaxis].repeat(6,axis=2).repeat(6,axis=3) * DS
+                S[0:n_e_active], DS, IND_p,_,_ = constitutive_problem(E[0:n_e_active], Ep_prev[0:n_e_active], Hard_prev[0:n_e_active], shear[0:n_e_active], bulk[0:n_e_active], a[0:n_e_active], Y[0:n_e_active])
+                vD = ele_detJac_active[:,:,cp.newaxis,cp.newaxis].repeat(6,axis=2).repeat(6,axis=3) * DS
                 D_p = cusparse.csr_matrix((cp.ndarray.flatten(vD), (cp.ndarray.flatten(iD),cp.ndarray.flatten(jD))), shape = D_elast.shape, dtype = cp.float_)
-                K_tangent = K_elast + B.transpose()*(D_p-D_elast)*B
-                #K_tangent = B.transpose()*(D_p)*B
+                
+                # --- EXPLICIT TANGENT ASSEMBLY ---
+                # Avoid K_elast since it is None. Calculate directly via D_p.
+                K_tangent = B.transpose() * D_p * B
+                
                 n_plast = len(IND_p[IND_p])
                 print(' plastic integration points: ', n_plast, ' of ', IND_p.shape[0]*IND_p.shape[1])
-                F_dof = B.transpose() @ ((ele_detJac[:, :, cp.newaxis].repeat(6, axis=2) * S).reshape(-1))
-                # active node count as Python int
-                n_n_active_i = int(n_n_active.item()) if hasattr(n_n_active, "item") else int(n_n_active)
-
-                # DOF mask for active, non-Dirichlet DOFs (length = 3*n_n_active_i)
-                mask = Q[:n_n_active_i, :].reshape(-1)
-                free = cp.where(mask)[0]   # integer indices (more robust than boolean indexing for assignment)
-
-                # Reduced linear system
+                F = B.transpose() @ ((ele_detJac_active[:,:,cp.newaxis].repeat(6,axis=2)*S[0:n_e_active]).reshape(-1))
+                
+                # --- SOLVER PATCH ---
+                # Safely extract free DOFs using integer array instead of boolean mask directly on SpMatrix
+                mask = Q[0:n_n_active].flatten()
+                free = cp.where(mask)[0]
+                
                 A = K_tangent[free][:, free]
-                b = -F_dof[free]
-
-                x, info = cusparse_linalg.cg(A, b, tol=tol)
-
-                # Put solution back into full active DOF vector, then into (n_nodes,3)
-                dUv = cp.zeros(3 * n_n_active_i, dtype=F_dof.dtype)
+                b = -F[free]
+                
+                x, error = cusparse_linalg.cg(A, b, rtol=tol)
+                
+                dUv = cp.zeros(3 * int(n_n_active), dtype=cp.float_)
                 dUv[free] = x
-                dU[:n_n_active_i, :] = dUv.reshape(n_n_active_i, 3)
+                dU[0:n_n_active, :] = dUv.reshape(int(n_n_active), 3)
 
-                error = info
                 U_new = U_it + beta*dU[0:n_n_active,:] 
-                q1 = beta**2*dU[0:n_n_active].flatten()@K_elast@dU[0:n_n_active].flatten()
-                q2 = U_it[0:n_n_active].flatten()@K_elast@U_it[0:n_n_active].flatten()
-                q3 = U_new[0:n_n_active].flatten()@K_elast@U_new[0:n_n_active].flatten()
+                
+                # --- MATRIX-FREE ENERGY CALCULATION ---
+                # Replaces `@ K_elast @`
+                def compute_energy(vec):
+                    strain = B.dot(vec)
+                    stress = D_elast.dot(strain)
+                    return strain.dot(stress)
+
+                q1 = beta**2 * compute_energy(dU[0:n_n_active].flatten())
+                q2 = compute_energy(U_it.flatten())
+                q3 = compute_energy(U_new.flatten())
+                
                 if q2 == 0 and q3 == 0:
                     criterion = 0
                 else:
@@ -184,7 +196,7 @@ while domain.current_sim_time<endtime-domain.dt:
                 U_it = cp.array(U_new) 
                 # test on the stopping criterion
                 if  criterion < tol:
-                    print('F = ', cp.linalg.norm(F_dof[free]))
+                    print('F = ', cp.linalg.norm(F[free]))
                     break
             else:
                 continue
@@ -196,7 +208,7 @@ while domain.current_sim_time<endtime-domain.dt:
         E[0:n_e_active] = cp.reshape(B@U_it.flatten(),(-1,8,6))
         E[0:n_e_active] = E[0:n_e_active] - (temperature_ip[0:n_e_active,:,cp.newaxis].repeat(6,axis=2)-T_Ref)*alpha_Th[0:n_e_active]
           
-        S, DS, IND_p,Ep,Hard = constitutive_problem(E[0:n_e_active], Ep_prev[0:n_e_active], Hard_prev[0:n_e_active], shear[0:n_e_active], bulk[0:n_e_active], a[0:n_e_active], Y[0:n_e_active])
+        S[0:n_e_active], DS, IND_p,Ep,Hard = constitutive_problem(E[0:n_e_active], Ep_prev[0:n_e_active], Hard_prev[0:n_e_active], shear[0:n_e_active], bulk[0:n_e_active], a[0:n_e_active], Y[0:n_e_active])
         Ep_prev[0:n_e_active] = Ep
         Hard_prev[0:n_e_active] = Hard
         n_e_old = n_e_active

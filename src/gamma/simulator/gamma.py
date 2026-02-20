@@ -520,10 +520,13 @@ class domain_mgr():
 
 
     def update_birth(self):
-        self.active_elements = self.element_birth<=self.current_sim_time
-        self.active_nodes = self.node_birth<=self.current_sim_time
-        self.active_surface = (self.surface_birth[:,0]<=self.current_sim_time)*(self.surface_birth[:,1]>self.current_sim_time)
-    
+        # Force boolean masks to generate directly on the GPU
+        self.active_elements = cp.asarray(self.element_birth) <= self.current_sim_time
+        self.active_nodes = cp.asarray(self.node_birth) <= self.current_sim_time
+        
+        surf_birth = cp.asarray(self.surface_birth)
+        self.active_surface = (surf_birth[:,0] <= self.current_sim_time) & (surf_birth[:,1] > self.current_sim_time)
+
     def get_ele_J(self):
         nodes_pos = self.nodes[self.elements]
         Jac = cp.matmul(self.Bip_ele,nodes_pos[:,cp.newaxis,:,:].repeat(8,axis=1)) # J = B*x [B:8(nGP)*3(dim)*8(nN), x:nE*8*8*3]
@@ -631,48 +634,56 @@ class heat_solve_mgr():
         self.isothermal = 1
         
     def update_cp_cond(self):
-        domain=self.domain
-        elements = domain.elements
-        temperature_nodes = self.temperature[elements]
+        domain = self.domain
+        
+        # 1. Cast indices to GPU to prevent PCIe fetching
+        elements_gpu = cp.asarray(domain.elements)
+        temperature_nodes = self.temperature[elements_gpu]
+        
         temperature_ip = (domain.Nip_ele[:,cp.newaxis,:]@temperature_nodes[:,cp.newaxis,:,cp.newaxis].repeat(8,axis=1))[:,:,0,0]
         
         self.density_Cp_Ip *= 0
         self.Cond_Ip *= 0
         
-        ##### temp-dependent, modification needed, from files
+        # 2. Cast material array to GPU
+        element_mat_gpu = cp.asarray(domain.element_mat)
+        
         for i in range(0,len(domain.mat_thermal)):
             matID = domain.mat_thermal[i][0]
-            mat = domain.element_mat == matID
-            thetaIp = temperature_ip[domain.active_elements*mat]
+            mat = element_mat_gpu == matID
+            
+            # 3. Bitwise AND is the fastest way to combine GPU boolean masks
+            mask = domain.active_elements & mat 
+            
+            thetaIp = temperature_ip[mask]
             
             solidus = domain.mat_thermal[i][2]
             liquidus = domain.mat_thermal[i][3]
             latent = domain.mat_thermal[i][4]/(liquidus-solidus)
             density = domain.mat_thermal[i][1]
             
-            self.density_Cp_Ip[domain.active_elements*mat] += density*latent*(thetaIp>solidus)*(thetaIp<liquidus)
+            self.density_Cp_Ip[mask] += density*latent*(thetaIp>solidus)*(thetaIp<liquidus)
             
             if domain.mat_thermal[i][5] == -1:
                 temp_Cp = cp.asarray(domain.thermal_TD[matID][0][:,0])
                 Cp = cp.asarray(domain.thermal_TD[matID][0][:,1])            
-                self.density_Cp_Ip[domain.active_elements*mat] += density*cp.interp(thetaIp,temp_Cp,Cp)
+                self.density_Cp_Ip[mask] += density*cp.interp(thetaIp,temp_Cp,Cp)
             else:
                 Cp = domain.mat_thermal[i][5]
-                self.density_Cp_Ip[domain.active_elements*mat] += density*Cp
+                self.density_Cp_Ip[mask] += density*Cp
                 
-            
             if domain.mat_thermal[i][6] == -1:
                 temp_Cond = cp.asarray(domain.thermal_TD[matID][1][:,0])
                 Cond = cp.asarray(domain.thermal_TD[matID][1][:,1])
-                self.Cond_Ip[domain.active_elements*mat] += cp.interp(thetaIp,temp_Cond,Cond)
+                self.Cond_Ip[mask] += cp.interp(thetaIp,temp_Cond,Cond)
             else:
-                self.Cond_Ip[domain.active_elements*mat] += domain.mat_thermal[i][6]
+                self.Cond_Ip[mask] += domain.mat_thermal[i][6]
 
 
    
     def update_mvec_stifness(self):
         nodes = self.domain.nodes
-        elements = self.domain.elements[self.domain.active_elements]
+        elements = cp.asarray(self.domain.elements)[self.domain.active_elements]
         Bip_ele = self.domain.Bip_ele
         Nip_ele = self.domain.Nip_ele
         temperature_nodes = self.temperature[elements]
@@ -696,7 +707,7 @@ class heat_solve_mgr():
         
 
     def update_fluxes(self):
-        surface = self.domain.surface[self.domain.active_surface]
+        surface = cp.asarray(self.domain.surface)[self.domain.active_surface]
         nodes = self.domain.nodes
         Nip_sur = self.domain.Nip_sur
         Bip_sur = self.domain.Bip_sur
