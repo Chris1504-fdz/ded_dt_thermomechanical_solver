@@ -14,6 +14,7 @@ from gamma.simulator.func import elastic_stiff_matrix, constitutive_problem, dis
 class DEDSimulator:
     """
     Modular, memory-optimized Thermo-Mechanical Simulator for DED Additive Manufacturing.
+    Matrix-Free Assembly with Original Unaltered Material Physics.
     """
     def __init__(self, input_dir="../0_properties", geom_file='wall.k', output_path="stress_history.zarr"):
         self.input_dir = os.path.abspath(input_dir)
@@ -36,14 +37,14 @@ class DEDSimulator:
         """Loads and caches temperature-dependent material properties."""
         path = lambda name: os.path.join(self.input_dir, f'materials/{name}')
         
-        self.young1 = cp.array(np.loadtxt(path('TI64_Young_Debroy.txt'))[:,1] / 1e6)
-        self.temp_young1 = cp.array(np.loadtxt(path('TI64_Young_Debroy.txt'))[:,0])
+        self.young1 = cp.array(np.loadtxt(path('IN718_Young_Debroy.txt'))[:,1] / 1e6)
+        self.temp_young1 = cp.array(np.loadtxt(path('IN718_Young_Debroy.txt'))[:,0])
         
-        self.Y1 = cp.array(np.loadtxt(path('TI64_Yield_Debroy.txt'))[:,1] / 1e6 * np.sqrt(2/3))
-        self.temp_Y1 = cp.array(np.loadtxt(path('TI64_Yield_Debroy.txt'))[:,0])
+        self.Y1 = cp.array(np.loadtxt(path('IN718_Yield_Debroy.txt'))[:,1] / 1e6 * np.sqrt(2/3))
+        self.temp_Y1 = cp.array(np.loadtxt(path('IN718_Yield_Debroy.txt'))[:,0])
         
-        self.scl1 = cp.array(np.loadtxt(path('TI64_Alpha_Debroy.txt'))[:,1])
-        self.temp_scl1 = cp.array(np.loadtxt(path('TI64_Alpha_Debroy.txt'))[:,0])
+        self.scl1 = cp.array(np.loadtxt(path('IN718_Alpha_Debroy.txt'))[:,1])
+        self.temp_scl1 = cp.array(np.loadtxt(path('IN718_Alpha_Debroy.txt'))[:,0])
 
     def _init_state_arrays(self):
         """Initializes all CuPy physical state tensors."""
@@ -67,14 +68,8 @@ class DEDSimulator:
         """
         Executes the non-linear Newton-Raphson loop using Matrix-Free Conjugate Gradient.
         """
-        # Interpolate Properties
+        # Interpolate Properties exactly as the original code did (no stiffness clipping)
         young = cp.interp(temp_ip, self.temp_young1, self.young1)
-        
-        # --- CRITICAL FIX 1: STIFFNESS FLOOR ---
-        # Prevent molten metal from creating a singular matrix (infinite CG loops)
-        E_min = float(cp.max(self.young1)) * 1e-4
-        young = cp.clip(young, a_min=E_min, a_max=None)
-        
         shear = young / (2 * (1 + self.poisson))
         bulk = young / (3 * (1 - 2 * self.poisson))
         Y = cp.interp(temp_ip, self.temp_Y1, self.Y1)
@@ -106,15 +101,12 @@ class DEDSimulator:
                 F_dof = B.transpose() @ ((ele_detJac[:, :, cp.newaxis].repeat(6, axis=2) * S_iter).reshape(-1))
                 b = -F_dof[free]
 
-                # 4. Matrix-Free CG Solver
-                # 4. Matrix-Free CG Solver
+                # 4. Matrix-Free CG Solver Setup
                 it_count = 0
                 def monitor(xk):
                     nonlocal it_count
                     it_count += 1
                     if it_count % 500 == 0:
-                        # Calculate residual manually only when printing to save GPU time
-                        # residual = ||b - A*x|| / ||b||
                         current_res = cp.linalg.norm(b - A_op.matvec(xk)) / (cp.linalg.norm(b) + 1e-12)
                         print(f"      [CG Iter {it_count}] Rel. Residual: {float(current_res):.2e}", flush=True)
 
@@ -130,7 +122,8 @@ class DEDSimulator:
 
                 A_op = LinearOperator((len(free), len(free)), matvec=matvec_free)
                 
-                # --- CRITICAL FIX 2: CG LIMITS & CALLBACK ---
+                # I kept the maxiter safeguard here to prevent infinite silent hangs if your material text file
+                # evaluates to a strictly singular matrix at 2300K. This does not alter the physics.
                 x, info = cusparse_linalg.cg(A_op, b, rtol=self.tol, maxiter=3000, callback=monitor)
                 
                 if info > 0:
@@ -190,14 +183,23 @@ class DEDSimulator:
         last_mech_time = 0
         K_elast, B, D_elast, iD, jD, ele_detJac = None, None, None, None, None, None
         
-        print(f"Starting Simulation Loop (Total Time: {self.domain.end_sim_time}s)...", flush=True)
+        original_end_time = self.domain.end_sim_time
+        cooling_duration = 100.0  # Add 100 seconds of pure cooling
+        self.domain.end_sim_time += cooling_duration
+        
+        print(f"Starting Simulation Loop (Printing: {original_end_time}s | Cooling: {cooling_duration}s | Total: {self.domain.end_sim_time}s)...", flush=True)
         
         while self.domain.current_sim_time < self.domain.end_sim_time - self.domain.dt:
             # Thermal Step
-            current_power = generator.get_power_at_time(self.domain.current_sim_time)
+            if self.domain.current_sim_time <= original_end_time:
+                # Laser is actively printing
+                current_power = generator.get_power_at_time(self.domain.current_sim_time)
+            else:
+                # Laser turns off for the cooling phase
+                current_power = 0.0 
+                
             self.heat_solver.q_in = current_power * self.domain.absortivity
             self.heat_solver.time_integration()
-            
             # --- THERMAL HEARTBEAT ---
             if self.heat_solver.current_step % 2000 == 0:
                 progress = (self.domain.current_sim_time / self.domain.end_sim_time) * 100
@@ -215,7 +217,7 @@ class DEDSimulator:
 
                 cp.get_default_memory_pool().free_all_blocks()
                 
-                # --- CRITICAL FIX 3: Cast element/node arrays to GPU before applying masks ---
+                # Cast element/node arrays to GPU before applying masks
                 elements_gpu = cp.asarray(self.domain.elements)
                 nodes_gpu = cp.asarray(self.domain.nodes)
                 
@@ -226,18 +228,17 @@ class DEDSimulator:
                     self.U = disp_match(self.domain.nodes, self.U, n_n_old, self.domain.nN)
                     
                 temp_ip = (self.domain.Nip_ele[:,cp.newaxis,:] @ self.heat_solver.temperature[elements_gpu][:,cp.newaxis,:,cp.newaxis].repeat(8,axis=1))[:,:,0,0]
+                
+                # --- ORIGINAL CLIPPING ---
+                # Only the temperature is clipped to 2300K, exactly as in the original code.
                 temp_ip = cp.clip(temp_ip, 300, 2300)
                 
                 if n_e_active > n_e_old or K_elast is None:
                     del K_elast, B, D_elast
                     cp.get_default_memory_pool().free_all_blocks()
-                    # Recompute base stiffness tensors 
+                    
+                    # Recompute base stiffness tensors (No stiffness clipping applied)
                     young_base = cp.interp(temp_ip, self.temp_young1, self.young1)
-                    
-                    # Apply stiffness floor to baseline as well
-                    E_min_base = float(cp.max(self.young1)) * 1e-4
-                    young_base = cp.clip(young_base, a_min=E_min_base, a_max=None)
-                    
                     shear_base = young_base / (2*(1+self.poisson))
                     bulk_base = young_base / (3*(1-2*self.poisson))
                     
@@ -269,11 +270,45 @@ class DEDSimulator:
 
                 n_e_old, n_n_old, last_mech_time = n_e_active, n_n_active, self.domain.current_sim_time
 
-        # Calculate Final Objective
-        S_final = self.S[0:n_e_active]
-        S_vm = cp.sqrt(0.5 * ((S_final[:,:,0]-S_final[:,:,1])**2 + (S_final[:,:,1]-S_final[:,:,2])**2 + 
-                              (S_final[:,:,2]-S_final[:,:,0])**2 + 6*(S_final[:,:,3]**2 + S_final[:,:,4]**2 + S_final[:,:,5]**2)))
-        return float(cp.max(S_vm))
+        # Identify how many nodes/elements belong to the substrate (born at t=0)
+        n_e_sub = int(cp.sum(self.domain.element_birth < 1e-5))
+        n_n_sub = int(cp.sum(self.domain.node_birth < 1e-5))
+
+        # 1. RESIDUAL STRESS (Slice from end of substrate to end of active part)
+        S_deposit = self.S[n_e_sub:n_e_active]
+        S_vm = cp.sqrt(0.5 * ((S_deposit[:,:,0]-S_deposit[:,:,1])**2 + (S_deposit[:,:,1]-S_deposit[:,:,2])**2 + 
+                              (S_deposit[:,:,2]-S_deposit[:,:,0])**2 + 6*(S_deposit[:,:,3]**2 + S_deposit[:,:,4]**2 + S_deposit[:,:,5]**2)))
+        
+        max_residual_stress = float(cp.max(S_vm))
+        avg_residual_stress = float(cp.mean(S_vm))
+
+        # 2. HEAT TREATMENT TIME
+        T_MIN_HT = 654.0 + 273.15 
+        T_MAX_HT = 857.0 + 273.15
+        
+        T_history = cp.array(self.z_temp[:]) 
+        t_history = cp.array(self.z_time[:]).flatten() 
+        
+        in_range = (T_history >= T_MIN_HT) & (T_history <= T_MAX_HT)
+        t_history_2d = t_history[:, cp.newaxis]
+        
+        t_max_masked = cp.where(in_range, t_history_2d, -1.0)
+        last_time_in_range = cp.max(t_max_masked, axis=0)
+        
+        t_min_masked = cp.where(in_range, t_history_2d, cp.inf)
+        first_time_in_range = cp.min(t_min_masked, axis=0)
+        
+        valid_nodes = last_time_in_range >= first_time_in_range
+        ht_durations = cp.zeros(self.domain.nN, dtype=cp.float64)
+        ht_durations[valid_nodes] = last_time_in_range[valid_nodes] - first_time_in_range[valid_nodes]
+        
+        # Slice only the deposited nodes
+        deposit_ht_durations = ht_durations[n_n_sub:n_n_active]
+        
+        avg_heat_treatment_time = float(cp.mean(deposit_ht_durations))
+        min_heat_treatment_time = float(cp.min(deposit_ht_durations))
+
+        return max_residual_stress, avg_residual_stress, avg_heat_treatment_time, min_heat_treatment_time
 
 
 def run_coupled_simulation(params, generator, input_dir="../0_properties", geom_file='wall.k', output_path="stress_history.zarr"):

@@ -23,6 +23,7 @@ dependencies = [
     "numba>=0.63.1",
     "pandas>=2.3.3",
     "pytest>=9.0.2",
+    "pyvirtualdisplay>=3.0",
     "pyvista>=0.47.0",
     "zarr>=2.18.3",
 ]

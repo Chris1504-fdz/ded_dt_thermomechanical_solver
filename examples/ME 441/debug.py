@@ -14,7 +14,7 @@ from thermomechanical import run_coupled_simulation
 SIM_DURATION = 121.1  # Ensure this matches your .crs file duration
 PROPERTIES_DIR = "."
 GEOM_FILE = "thinwall.k"
-OUTPUT_ZARR = "debug_stress.zarr"
+OUTPUT_ZARR = "cg_test.zarr"
 cp.cuda.Device(0).use()
 
 def run_debug():
@@ -34,7 +34,6 @@ def run_debug():
     print("Previewing power profile...")
     test_times = [0.0, SIM_DURATION * 0.25, SIM_DURATION * 0.5, SIM_DURATION * 0.75]
     for t in test_times:
-        # ---> CRITICAL FIX: Remove 'random_params' from this call
         p = generator.get_power_at_time(t)
         print(f"  t={t:.3f}s -> Power={p:.2f}W")
     print("")
