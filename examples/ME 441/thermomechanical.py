@@ -124,7 +124,7 @@ class DEDSimulator:
                 
                 # I kept the maxiter safeguard here to prevent infinite silent hangs if your material text file
                 # evaluates to a strictly singular matrix at 2300K. This does not alter the physics.
-                x, info = cusparse_linalg.cg(A_op, b, rtol=self.tol, maxiter=3000, callback=monitor)
+                x, info = cusparse_linalg.cg(A_op, b, rtol=self.tol, maxiter=30000, callback=monitor)
                 
                 if info > 0:
                     print(f"    !!! CG hit maxiter (3000) without reaching tolerance.", flush=True)
@@ -163,7 +163,7 @@ class DEDSimulator:
             
         return U_it, S_iter, Ep_converged, Hard_converged
 
-    def run(self, params, generator):
+    def run(self, params, generator, active_print_time):
         """Executes the coupled time loop."""
         print(f"Step 1: Loading domain and toolpath...", flush=True)
         self.domain = domain_mgr(filename=self.geom_file, input_data_dir=self.input_dir, verbose=True)
@@ -183,15 +183,14 @@ class DEDSimulator:
         last_mech_time = 0
         K_elast, B, D_elast, iD, jD, ele_detJac = None, None, None, None, None, None
         
-        original_end_time = self.domain.end_sim_time
-        cooling_duration = 100.0  # Add 100 seconds of pure cooling
-        self.domain.end_sim_time += cooling_duration
-        
-        print(f"Starting Simulation Loop (Printing: {original_end_time}s | Cooling: {cooling_duration}s | Total: {self.domain.end_sim_time}s)...", flush=True)
+        total_sim_time = self.domain.end_sim_time
+        cooling_duration = total_sim_time - active_print_time
+                
+        print(f"Starting Simulation Loop (Printing: {active_print_time}s | Cooling: {cooling_duration}s | Total: {self.domain.end_sim_time}s)...", flush=True)
         
         while self.domain.current_sim_time < self.domain.end_sim_time - self.domain.dt:
             # Thermal Step
-            if self.domain.current_sim_time <= original_end_time:
+            if self.domain.current_sim_time <= active_print_time:
                 # Laser is actively printing
                 current_power = generator.get_power_at_time(self.domain.current_sim_time)
             else:
@@ -311,13 +310,13 @@ class DEDSimulator:
         return max_residual_stress, avg_residual_stress, avg_heat_treatment_time, min_heat_treatment_time
 
 
-def run_coupled_simulation(params, generator, input_dir="../0_properties", geom_file='wall.k', output_path="stress_history.zarr"):
+def run_coupled_simulation(params, generator, input_dir="../0_properties", geom_file='wall.k', output_path="stress_history.zarr", active_print_time=40.0):
     """
     Wrapper function to maintain compatibility with existing BO loops.
     """
     try:
         sim = DEDSimulator(input_dir=input_dir, geom_file=geom_file, output_path=output_path)
-        objective = sim.run(params, generator)
+        objective = sim.run(params, generator, active_print_time=active_print_time)
         return objective
     finally:
         # Guarantee massive GPU arrays are wiped out even if the simulation crashes

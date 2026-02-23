@@ -10,10 +10,11 @@ from botorch.fit import fit_gpytorch_mll
 from gpytorch.mlls import SumMarginalLogLikelihood
 from botorch.utils.multi_objective.box_decompositions.non_dominated import NondominatedPartitioning
 from botorch.acquisition.multi_objective.monte_carlo import qExpectedHypervolumeImprovement
+from botorch.acquisition.multi_objective.objective import IdentityMCMultiOutputObjective
 from botorch.optim import optimize_acqf
 
 # --- CONFIGURATION ---
-SIM_DURATION = 121.1  
+SIM_DURATION = 34.1
 PROPERTIES_DIR = "."
 GEOM_FILE = "thinwall.k"
 NUM_PARAMS = 10
@@ -52,7 +53,8 @@ def isolated_simulation_worker(task_index, params_np):
             generator=generator,
             input_dir=PROPERTIES_DIR,
             geom_file=GEOM_FILE,
-            output_path=unique_zarr
+            output_path=unique_zarr,
+            active_print_time=SIM_DURATION
         )
     except Exception as e:
         print(f"[!] Worker {task_index} FAILED: {e}")
@@ -118,7 +120,7 @@ def run_optimization(train_X, train_Y, num_iterations=10):
             ref_point=ref_point,
             partitioning=partitioning,
             constraints=constraints,
-            objective_index=[0, 1]
+            objective=IdentityMCMultiOutputObjective(outcomes=[0, 1])
         )
         
         print(f"Solving Acquisition Function for {BATCH_SIZE} candidates...")
