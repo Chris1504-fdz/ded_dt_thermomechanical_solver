@@ -2,14 +2,16 @@ import os
 import torch
 import numpy as np
 import concurrent.futures
+import multiprocessing
 from scipy.stats import qmc
 
 # BoTorch Imports
 from botorch.models import ModelListGP, SingleTaskGP
+from botorch.models.transforms.outcome import Standardize
 from botorch.fit import fit_gpytorch_mll
 from gpytorch.mlls import SumMarginalLogLikelihood
 from botorch.utils.multi_objective.box_decompositions.non_dominated import NondominatedPartitioning
-from botorch.acquisition.multi_objective.monte_carlo import qExpectedHypervolumeImprovement
+from botorch.acquisition.multi_objective.logei import qLogExpectedHypervolumeImprovement
 from botorch.acquisition.multi_objective.objective import IdentityMCMultiOutputObjective
 from botorch.optim import optimize_acqf
 
@@ -19,34 +21,29 @@ PROPERTIES_DIR = "."
 GEOM_FILE = "thinwall.k"
 NUM_PARAMS = 10
 
-GPU_MAPPING = [1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]
+GPU_MAPPING = [1, 2, 3] 
 BATCH_SIZE = len(GPU_MAPPING)
 
-def isolated_simulation_worker(task_index, params_np):
+def isolated_simulation_worker(task_index, global_eval_id, params_np):
     """
-    Strictly sandboxed worker. Blinds the process to other GPUs before CuPy loads.
+    Strictly sandboxed worker.
     """
     gpu_id = GPU_MAPPING[task_index]
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     
-    # CuPy and custom modules MUST be imported inside this function
     import cupy as cp
     from laser_generator import LaserProfileGenerator
     from thermomechanical import run_coupled_simulation
     
-    # Force CuPy to use the only device it can see (which is internally ID 0)
     cp.cuda.Device(0).use()
+    print(f"[Eval {global_eval_id}] Initializing on GPU {gpu_id}...")
     
-    print(f"[Worker {task_index}] Initializing on physical GPU {gpu_id}...")
-    
-    # 1. Initialize Laser Generator
     generator = LaserProfileGenerator(total_time=SIM_DURATION)
     generator.generate_profile(params_np)
     
-    # 2. Unique Zarr output to prevent parallel overwrite collisions
-    unique_zarr = f"stress_history_task_{task_index}.zarr"
+    # Naming continuously from 0 to 60
+    unique_zarr = f"stress_history_eval_{global_eval_id}.zarr"
     
-    # 3. Run the physics
     try:
         max_stress, avg_stress, avg_ht, min_ht = run_coupled_simulation(
             params=params_np,
@@ -57,31 +54,24 @@ def isolated_simulation_worker(task_index, params_np):
             active_print_time=SIM_DURATION
         )
     except Exception as e:
-        print(f"[!] Worker {task_index} FAILED: {e}")
-        # Return a heavily penalized result if the simulation crashes
+        print(f"[!] Eval {global_eval_id} FAILED: {e}")
         max_stress, avg_stress, avg_ht, min_ht = 2000.0, 1500.0, 0.0, 0.0
     
-    # 4. Flush GPU memory before the process returns
     cp.get_default_memory_pool().free_all_blocks()
-    
-    # Return formatted for BoTorch: [Obj 1 (Maximize), Obj 2 (Maximize), Constraint 1, Constraint 2]
     return [-avg_stress, avg_ht, min_ht, max_stress]
 
 def generate_initial_data(num_samples):
-    """Generates initial dataset using Latin Hypercube Sampling across GPUs."""
     print(f"\n--- GENERATING INITIAL DATASET ({num_samples} SAMPLES) ---")
     sampler = qmc.LatinHypercube(d=NUM_PARAMS)
     init_X_np = sampler.random(n=num_samples)
-    
     results = [None] * num_samples
     
-    # Map the initial samples to the GPUs using the same isolated worker
     with concurrent.futures.ProcessPoolExecutor(max_workers=BATCH_SIZE) as executor:
         future_to_idx = {
-            executor.submit(isolated_simulation_worker, i % BATCH_SIZE, init_X_np[i]): i 
+            # Passing iteration 0 for the initial generation
+            executor.submit(isolated_simulation_worker, i % BATCH_SIZE, i, init_X_np[i]): i 
             for i in range(num_samples)
         }
-        
         for future in concurrent.futures.as_completed(future_to_idx):
             idx = future_to_idx[future]
             results[idx] = future.result()
@@ -89,33 +79,59 @@ def generate_initial_data(num_samples):
 
     return torch.tensor(init_X_np, dtype=torch.float64), torch.tensor(results, dtype=torch.float64)
 
-def run_optimization(train_X, train_Y, num_iterations=10):
+def run_optimization(train_X, train_Y, total_iterations=20):
     bounds = torch.tensor([[0.0] * NUM_PARAMS, [1.0] * NUM_PARAMS], dtype=torch.float64)
     
     T_MIN = 15.0     
     S_MAX = 1200.0   
+    
+    # YOUR ORIGINAL CONSTRAINTS (Negative = Feasible)
     constraints = [
         lambda Z: T_MIN - Z[..., 2], 
-        lambda Z: Z[..., 3] - S_MAX   
+        lambda Z: Z[..., 3] - S_MAX  
     ]
     
     ref_point = torch.tensor([-1500.0, 0.0], dtype=torch.float64)
 
-    for iteration in range(num_iterations):
+    # Calculate starting iteration from existing data
+    start_iter = len(train_X) // BATCH_SIZE
+
+    for iteration in range(start_iter, total_iterations):
         print(f"\n{'='*40}")
-        print(f" BO ITERATION {iteration + 1} / {num_iterations}")
+        print(f" BO ITERATION {iteration + 1} / {total_iterations}")
         print(f"{'='*40}")
         
         print("Training GP Models...")
-        models = [SingleTaskGP(train_X, train_Y[..., i:i+1]) for i in range(4)]
+        models = []
+        for i in range(4):
+                # Standardize Objectives so qEHVI isn't dominated by stress values
+            models.append(SingleTaskGP(train_X, train_Y[..., i:i+1], outcome_transform=Standardize(m=1)))
+                
         model = ModelListGP(*models)
         mll = SumMarginalLogLikelihood(model.likelihood, model)
         fit_gpytorch_mll(mll)
         
-        obj_Y = train_Y[..., 0:2]
-        partitioning = NondominatedPartitioning(ref_point=ref_point, Y=obj_Y)
+        # 1. Evaluate constraint feasibility on the historical data (Negative = Feasible)
+        c1_hist = T_MIN - train_Y[..., 2]
+        c2_hist = train_Y[..., 3] - S_MAX
+        is_feasible = (c1_hist <= 0.0) & (c2_hist <= 0.0)
         
-        acq_func = qExpectedHypervolumeImprovement(
+        # 2. Extract only the simulations that physically survived
+        feasible_Y = train_Y[is_feasible]
+        
+        # 3. Build the Pareto front ONLY from feasible objectives
+        if feasible_Y.shape[0] > 0:
+            obj_Y_feasible = feasible_Y[..., 0:2]
+            # Dynamic Reference Point: 10% worse than the worst feasible objectives
+            ref_point = obj_Y_feasible.min(dim=0).values - (obj_Y_feasible.min(dim=0).values.abs() * 0.1)
+        else:
+            obj_Y_feasible = torch.empty((0, 2), dtype=torch.float64)
+            # Fallback Reference Point if no feasible points exist yet
+            ref_point = torch.tensor([-1500.0, 0.0], dtype=torch.float64)
+            
+        partitioning = NondominatedPartitioning(ref_point=ref_point, Y=obj_Y_feasible)
+        
+        acq_func = qLogExpectedHypervolumeImprovement(
             model=model,
             ref_point=ref_point,
             partitioning=partitioning,
@@ -125,12 +141,8 @@ def run_optimization(train_X, train_Y, num_iterations=10):
         
         print(f"Solving Acquisition Function for {BATCH_SIZE} candidates...")
         candidates, _ = optimize_acqf(
-            acq_function=acq_func,
-            bounds=bounds,
-            q=BATCH_SIZE, 
-            num_restarts=10,
-            raw_samples=512,
-            sequential=True
+            acq_function=acq_func, bounds=bounds, q=BATCH_SIZE, 
+            num_restarts=10, raw_samples=512, sequential=False
         )
         
         print(f"Dispatching physics simulations to GPUs...")
@@ -138,16 +150,18 @@ def run_optimization(train_X, train_Y, num_iterations=10):
         candidates_np = candidates.detach().numpy()
         
         with concurrent.futures.ProcessPoolExecutor(max_workers=BATCH_SIZE) as executor:
-            future_to_idx = {
-                executor.submit(isolated_simulation_worker, i, candidates_np[i]): i 
-                for i in range(BATCH_SIZE)
-            }
-            
+            future_to_idx = {}
+            for i in range(BATCH_SIZE):
+                global_eval_id = len(train_X) + i  # Unique ID for this evaluation, based on total evaluations so far
+                # Passing the current iteration
+                future = executor.submit(isolated_simulation_worker, i, global_eval_id , candidates_np[i])
+                future_to_idx[future] = i
+
             for future in concurrent.futures.as_completed(future_to_idx):
                 idx = future_to_idx[future]
                 new_results[idx] = future.result()
                 print(f"  [+] BO Task {idx:02d} (GPU {GPU_MAPPING[idx]}) finished.")
-        
+
         new_Y = torch.tensor(new_results, dtype=torch.float64)
         train_X = torch.cat([train_X, candidates])
         train_Y = torch.cat([train_Y, new_Y])
@@ -158,8 +172,20 @@ def run_optimization(train_X, train_Y, num_iterations=10):
     return train_X, train_Y
 
 if __name__ == '__main__':
-    # Generate 11 initial random samples using Latin Hypercube
-    init_X, init_Y = generate_initial_data(num_samples=BATCH_SIZE)
+    multiprocessing.set_start_method('spawn', force=True)
     
+    # Change this string to point to your existing .pt file
+    CHECKPOINT_FILE = "bo_checkpoint_iter_1.pt" 
+    
+    if os.path.exists(CHECKPOINT_FILE):
+        print(f"\n--- WARM START: RESUMING FROM {CHECKPOINT_FILE} ---")
+        checkpoint = torch.load(CHECKPOINT_FILE)
+        init_X = checkpoint['train_X']
+        init_Y = checkpoint['train_Y']
+        print(f"Loaded {len(init_X)} previous evaluations.")
+    else:
+        print(f"\n--- NO CHECKPOINT FOUND. COLD STARTING ---")
+        init_X, init_Y = generate_initial_data(num_samples=BATCH_SIZE)
+        
     # Run the optimization loop
-    run_optimization(init_X, init_Y, num_iterations=20)
+    run_optimization(init_X, init_Y, total_iterations=30)

@@ -57,14 +57,22 @@ class DEDSimulator:
         self.U = cp.zeros((n_n, 3), dtype=cp.float64)
         self.alpha_Th = cp.zeros((n_e, self.n_q, 6), dtype=cp.float64)
         
-        # Zarr Storage
+        # --- OPTIMIZED ZARR STORAGE ---
         self.z_root = zarr.open(self.output_path, mode='w')
-        self.z_stress = self.z_root.create_array('stress', shape=(0, n_e, self.n_q, 6), chunks=(1, n_e, self.n_q, 6), dtype='f4', overwrite=True)
-        self.z_U = self.z_root.create_array('U', shape=(0, n_n, 3), chunks=(1, n_n, 3), dtype='f4', overwrite=True)
-        self.z_temp = self.z_root.create_array('temperature', shape=(0, n_n), chunks=(1, n_n), dtype='f4', overwrite=True)
-        self.z_time = self.z_root.create_array('time', shape=(0,), chunks=(100,), dtype='f4', overwrite=True)
+        
+        # Calculate worst-case maximum steps (using the smallest dt) to pre-allocate
+        min_dt = 0.02
+        self.max_expected_steps = int(self.domain.end_sim_time / min_dt) + 500
+        
+        # Pre-allocate full shapes on disk. No appending later.
+        self.z_stress = self.z_root.create_array('stress', shape=(self.max_expected_steps, n_e, self.n_q, 6), chunks=(1, n_e, self.n_q, 6), dtype='f4', overwrite=True)
+        self.z_U = self.z_root.create_array('U', shape=(self.max_expected_steps, n_n, 3), chunks=(1, n_n, 3), dtype='f4', overwrite=True)
+        self.z_temp = self.z_root.create_array('temperature', shape=(self.max_expected_steps, n_n), chunks=(1, n_n), dtype='f4', overwrite=True)
+        self.z_time = self.z_root.create_array('time', shape=(self.max_expected_steps,), chunks=(100,), dtype='f4', overwrite=True)
+        
+        self.save_step = 0
 
-    def _solve_mechanical_step(self, n_e_active, n_n_active, temp_ip, B, D_elast, iD, jD, ele_detJac, free, mask):
+    def _solve_mechanical_step(self, n_e_active, n_n_active, temp_ip, B, D_elast, iD, jD, ele_detJac, free, mask, K_diag):
         """
         Executes the non-linear Newton-Raphson loop using Matrix-Free Conjugate Gradient.
         """
@@ -79,7 +87,17 @@ class DEDSimulator:
         self.alpha_Th[:, :, 0:3] = scl[:, :, cp.newaxis].repeat(3, axis=2)
         
         Ep_converged, Hard_converged = None, None
+        v_full = cp.zeros(3 * n_n_active, dtype=cp.float64)
+        dUv = cp.zeros(3 * n_n_active, dtype=cp.float64)
         
+        # 2. Setup Jacobi Preconditioner
+        M_inv = 1.0 / (K_diag[free] + 1e-12) 
+        
+        def precond_matvec(v):
+            return M_inv * v
+            
+        M_op = LinearOperator((len(free), len(free)), matvec=precond_matvec)
+
         for beta in [1.0, 0.5, 0.3, 0.1]:
             U_it = self.U[0:n_n_active]
             
@@ -111,23 +129,20 @@ class DEDSimulator:
                         print(f"      [CG Iter {it_count}] Rel. Residual: {float(current_res):.2e}", flush=True)
 
                 def matvec_free(v_free):
-                    v_full = cp.zeros(3 * n_n_active, dtype=v_free.dtype)
+                    v_full.fill(0)
                     v_full[free] = v_free
                     temp1 = B.dot(v_full)
                     temp2 = D_p.dot(temp1)
-                    res_full = B.transpose().dot(temp2)
-                    res_free = res_full[free]
-                    del v_full, temp1, temp2, res_full
-                    return res_free
+                    return (B.transpose().dot(temp2))[free]
 
                 A_op = LinearOperator((len(free), len(free)), matvec=matvec_free)
                 
                 # I kept the maxiter safeguard here to prevent infinite silent hangs if your material text file
                 # evaluates to a strictly singular matrix at 2300K. This does not alter the physics.
-                x, info = cusparse_linalg.cg(A_op, b, rtol=self.tol, maxiter=30000, callback=monitor)
+                x, info = cusparse_linalg.cg(A_op, b, M=M_op, rtol=self.tol, maxiter=10000, callback=monitor)
                 
                 if info > 0:
-                    print(f"    !!! CG hit maxiter (3000) without reaching tolerance.", flush=True)
+                    print(f"    !!! CG hit maxiter (10000) without reaching tolerance.", flush=True)
                 elif info < 0:
                     print(f"    !!! CG failed with mathematical breakdown.", flush=True)
 
@@ -172,6 +187,9 @@ class DEDSimulator:
         print(f"Step 2: Preparing material arrays...", flush=True)
         self._load_materials()
         self._init_state_arrays()
+        self.cumulative_ht = cp.zeros(self.domain.nN, dtype=cp.float64)
+        T_MIN_HT = 654.0 + 273.15 
+        T_MAX_HT = 857.0 + 273.15
         generator.generate_profile(params)
         
         # Precompute boundary mask
@@ -181,7 +199,7 @@ class DEDSimulator:
         n_e_old = int(cp.sum(self.domain.element_birth < 1e-5))
         n_n_old = int(cp.sum(self.domain.node_birth < 1e-5))
         last_mech_time = 0
-        K_elast, B, D_elast, iD, jD, ele_detJac = None, None, None, None, None, None
+        K_diag, B, D_elast, iD, jD, ele_detJac = None, None, None, None, None, None
         
         total_sim_time = self.domain.end_sim_time
         cooling_duration = total_sim_time - active_print_time
@@ -199,6 +217,9 @@ class DEDSimulator:
                 
             self.heat_solver.q_in = current_power * self.domain.absortivity
             self.heat_solver.time_integration()
+            current_T = self.heat_solver.temperature
+            in_band = (current_T >= T_MIN_HT) & (current_T <= T_MAX_HT)
+            self.cumulative_ht[in_band] += self.domain.dt
             # --- THERMAL HEARTBEAT ---
             if self.heat_solver.current_step % 2000 == 0:
                 progress = (self.domain.current_sim_time / self.domain.end_sim_time) * 100
@@ -214,7 +235,7 @@ class DEDSimulator:
                 # --- MECHANICAL HEARTBEAT ---
                 print(f"  >>> MECHANICAL SOLVE: Time {self.domain.current_sim_time:.3f}s | Active Eles: {n_e_active}", flush=True)
 
-                cp.get_default_memory_pool().free_all_blocks()
+                # cp.get_default_memory_pool().free_all_blocks()
                 
                 # Cast element/node arrays to GPU before applying masks
                 elements_gpu = cp.asarray(self.domain.elements)
@@ -232,19 +253,17 @@ class DEDSimulator:
                 # Only the temperature is clipped to 2300K, exactly as in the original code.
                 temp_ip = cp.clip(temp_ip, 300, 2300)
                 
-                if n_e_active > n_e_old or K_elast is None:
-                    del K_elast, B, D_elast
-                    cp.get_default_memory_pool().free_all_blocks()
+                if n_e_active > n_e_old or K_diag is None:
+                    del K_diag, B, D_elast
+                    # cp.get_default_memory_pool().free_all_blocks()
                     
-                    # Recompute base stiffness tensors (No stiffness clipping applied)
                     young_base = cp.interp(temp_ip, self.temp_young1, self.young1)
                     shear_base = young_base / (2*(1+self.poisson))
                     bulk_base = young_base / (3*(1-2*self.poisson))
                     
-                    K_elast, B, D_elast, _, _, iD, jD, ele_detJac = elastic_stiff_matrix(
+                    K_diag, B, D_elast, _, _, iD, jD, ele_detJac = elastic_stiff_matrix(
                         active_eles, active_nodes, self.domain.Bip_ele, shear_base[0:n_e_active], bulk_base[0:n_e_active]
                     )
-                    del K_elast; K_elast = None
 
                 # Apply Boundary Conditions
                 Q_mask = cp.ones((n_n_active, 3), dtype=bool)
@@ -254,20 +273,38 @@ class DEDSimulator:
 
                 # Run Non-Linear Solver
                 U_it, S_iter, Ep_conv, Hard_conv = self._solve_mechanical_step(
-                    n_e_active, n_n_active, temp_ip, B, D_elast, iD, jD, ele_detJac, free, mask
+                    n_e_active, n_n_active, temp_ip, B, D_elast, iD, jD, ele_detJac, free, mask, K_diag
                 )
-                
                 # Update Global States
                 self.U[0:n_n_active], self.S[0:n_e_active] = U_it, S_iter
                 self.Ep_prev[0:n_e_active], self.Hard_prev[0:n_e_active] = Ep_conv, Hard_conv
                 
-                # Persist to Zarr
-                self.z_stress.append(self.S.get()[np.newaxis, ...], axis=0)
-                self.z_U.append(self.U.get()[np.newaxis, ...], axis=0)
-                self.z_temp.append(self.heat_solver.temperature.get()[np.newaxis, ...], axis=0)
-                self.z_time.append(np.array([self.domain.current_sim_time], dtype='f4'))
+                # --- OPTIMIZED ZARR WRITE ---
+                if self.save_step < self.max_expected_steps:
+                    # Transfer ONLY active regions to CPU. Unborn elements remain 0 on disk.
+                    cpu_S_active = self.S[:n_e_active].get()
+                    cpu_U_active = self.U[:n_n_active].get()
+                    
+                    self.z_stress[self.save_step, :n_e_active, :, :] = cpu_S_active
+                    self.z_U[self.save_step, :n_n_active, :] = cpu_U_active
+                    self.z_temp[self.save_step, :] = self.heat_solver.temperature.get()
+                    self.z_time[self.save_step] = self.domain.current_sim_time
+                    
+                    self.save_step += 1
+                else:
+                    print("WARNING: Zarr array max steps exceeded. Skipping save.", flush=True)
 
                 n_e_old, n_n_old, last_mech_time = n_e_active, n_n_active, self.domain.current_sim_time
+        # Identify how many nodes/elements belong to the substrate (born at t=0)
+        n_e_sub = int(cp.sum(self.domain.element_birth < 1e-5))
+        n_n_sub = int(cp.sum(self.domain.node_birth < 1e-5))
+
+        # --- TRUNCATE ZARR ARRAYS ---
+        # Strip away unused allocated time steps so Paraview doesn't read empty frames
+        self.z_stress.resize((self.save_step, self.domain.nE, self.n_q, 6))
+        self.z_U.resize((self.save_step, self.domain.nN, 3))
+        self.z_temp.resize((self.save_step, self.domain.nN))
+        self.z_time.resize((self.save_step,))
 
         # Identify how many nodes/elements belong to the substrate (born at t=0)
         n_e_sub = int(cp.sum(self.domain.element_birth < 1e-5))
@@ -281,28 +318,8 @@ class DEDSimulator:
         max_residual_stress = float(cp.max(S_vm))
         avg_residual_stress = float(cp.mean(S_vm))
 
-        # 2. HEAT TREATMENT TIME
-        T_MIN_HT = 654.0 + 273.15 
-        T_MAX_HT = 857.0 + 273.15
-        
-        T_history = cp.array(self.z_temp[:]) 
-        t_history = cp.array(self.z_time[:]).flatten() 
-        
-        in_range = (T_history >= T_MIN_HT) & (T_history <= T_MAX_HT)
-        t_history_2d = t_history[:, cp.newaxis]
-        
-        t_max_masked = cp.where(in_range, t_history_2d, -1.0)
-        last_time_in_range = cp.max(t_max_masked, axis=0)
-        
-        t_min_masked = cp.where(in_range, t_history_2d, cp.inf)
-        first_time_in_range = cp.min(t_min_masked, axis=0)
-        
-        valid_nodes = last_time_in_range >= first_time_in_range
-        ht_durations = cp.zeros(self.domain.nN, dtype=cp.float64)
-        ht_durations[valid_nodes] = last_time_in_range[valid_nodes] - first_time_in_range[valid_nodes]
-        
-        # Slice only the deposited nodes
-        deposit_ht_durations = ht_durations[n_n_sub:n_n_active]
+        # 2. HEAT TREATMENT TIME (Slice strictly deposited nodes)
+        deposit_ht_durations = self.cumulative_ht[n_n_sub:n_n_active]
         
         avg_heat_treatment_time = float(cp.mean(deposit_ht_durations))
         min_heat_treatment_time = float(cp.min(deposit_ht_durations))

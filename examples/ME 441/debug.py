@@ -1,6 +1,6 @@
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import torch
 import numpy as np
 import cupy as cp
@@ -11,7 +11,7 @@ from laser_generator import LaserProfileGenerator
 from thermomechanical import run_coupled_simulation
 
 # --- CONFIGURATION ---
-SIM_DURATION = 121.1  # Ensure this matches your .crs file duration
+SIM_DURATION =  84.1  # Ensure this matches your .crs file duration
 PROPERTIES_DIR = "."
 GEOM_FILE = "thinwall.k"
 OUTPUT_ZARR = "cg_test.zarr"

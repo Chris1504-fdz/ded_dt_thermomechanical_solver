@@ -44,10 +44,13 @@ def elastic_stiff_matrix(elements, nodes, Bip_ele, shear, bulk):
     D = cusparse.csr_matrix((cp.ndarray.flatten(ele_D),(cp.ndarray.flatten(iD), cp.ndarray.flatten(jD))), shape = (6*n_int, 6*n_int), dtype = cp.float_)
     # ele_K =  ele_B.transpose([0,1,3,2])@ele_D@ele_B
     # ele_K = ele_K.sum(axis = 1)
-
+    C = D.dot(B)
+    B_T_csr = B.transpose().tocsr()
+    C_T_csr = C.transpose().tocsr()
+    K_diag = cp.asarray(B_T_csr.multiply(C_T_csr).sum(axis=1)).flatten()
     # K = B.transpose()*D*B 
-    K = None
-    return K,B,D,ele_B,ele_D,iD,jD,ele_detJac
+    # K = None
+    return K_diag,B,D,ele_B,ele_D,iD,jD,ele_detJac
 
 def constitutive_problem(E, Ep_prev, Hard_prev, shear, bulk, a, Y, T_anneal = None, T = None):
     

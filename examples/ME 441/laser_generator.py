@@ -21,56 +21,56 @@ class LaserProfileGenerator:
 
     def generate_profile(self, params, min_power=400, max_power=700):
         """
-        Pre-calculates the entire power profile to establish global min/max 
-        values for accurate normalization. Must be called before simulation.
+        Maps normalized BO parameters to physical laser outputs.
         """
-        # Create full time array
         self.time_array = np.arange(0, self.total_time, self.time_step)
         x_norm = self._normalize_time(self.time_array)
 
         # Unpack params
         n, freq, amplitude, phase, trend, seasonality, frequency_slope, amplitude_slope, phase_slope, seasonality_freq = params
         
-        # Rescale params based on designated bounds
-        n = int(self._rescale(n, 0, 10))
-        if n < 1: n = 1 
+        # 1. Map to continuous physical constraints
+        # Smooth exponential decay for Fourier terms is much better for BO than an int cutoff
+        decay_rate = self._rescale(n, 0.5, 3.0) 
         
-        freq = self._rescale(freq, 0, 10)
-        amplitude = self._rescale(amplitude, 0, 10)
-        phase = self._rescale(phase, 0, 10000)
-        trend = self._rescale(trend, -500, 500)
-        seasonality = self._rescale(seasonality, 0, 500)
-        frequency_slope = self._rescale(frequency_slope, -1.25, 1.25)
-        amplitude_slope = self._rescale(amplitude_slope, -1.25, 1.25)
-        phase_slope = self._rescale(phase_slope, -1.25, 1.25)
-        seasonality_freq = self._rescale(seasonality_freq, -1, 1)
+        freq = self._rescale(freq, 0.1, 10.0)
+        amplitude_watts = self._rescale(amplitude, 0, 150) # Actual physical Watts!
+        phase = self._rescale(phase, 0, 2 * np.pi)
+        
+        trend_watts = self._rescale(trend, -150, 150)
+        seasonality_watts = self._rescale(seasonality, 0, 100)
+        
+        frequency_slope = self._rescale(frequency_slope, -1.0, 1.0)
+        amplitude_slope = self._rescale(amplitude_slope, -1.0, 1.0)
+        phase_slope = self._rescale(phase_slope, -1.0, 1.0)
+        seasonality_freq = self._rescale(seasonality_freq, 0.5, 5.0)
 
-        # 1. Base Fourier Series
+        # 2. Base Fourier Series (Continuous, no integer dead-zones)
         sum_val = np.zeros_like(x_norm)
-        for i in range(1, n + 1, 2):
-            term = (1 / i) * np.sin(2 * np.pi * (freq + i * frequency_slope) * i * x_norm + (phase + i * phase_slope))
+        num_terms = 5 # Fixed number of terms, but their power decays based on 'n' parameter
+        for i in range(1, num_terms * 2, 2):
+            # 'decay_rate' smoothly controls how much high-frequency noise is in the signal
+            term_weight = (1 / (i ** decay_rate)) 
+            term = term_weight * np.sin(2 * np.pi * (freq + i * frequency_slope) * i * x_norm + (phase + i * phase_slope))
             sum_val += term
 
-        y = (amplitude + n * amplitude_slope) * (2 / np.pi) * sum_val
+        # 3. Assemble Physical Profile
+        # Center the baseline exactly in the middle of your safe zone (550W)
+        baseline_power = 550.0 
         
-        # 2. Intermediate Normalization
-        if np.max(y) != np.min(y):
-            y = (y - np.min(y)) / (np.max(y) - np.min(y))
+        # Scale the normalized sum exactly to the requested amplitude in Watts
+        if np.max(sum_val) != np.min(sum_val):
+            sum_val = sum_val / np.max(np.abs(sum_val)) # Normalize to [-1, 1]
             
-        y = (y * 50) + 600  # rescale_amplitude=50, rescale_mag=600
+        y = baseline_power + (sum_val * (amplitude_watts + (x_norm * amplitude_slope * 50)))
+        
+        # Add Trend and Seasonality in absolute Watts
+        y += trend_watts * x_norm
+        y += seasonality_watts * np.sin(2 * np.pi * seasonality_freq * x_norm)
 
-        # 3. Apply Trend and Seasonality
-        y += trend * x_norm
-        y += seasonality * np.sin(2 * np.pi * seasonality_freq * x_norm)
-
-        # 4. Final Global Normalization to Laser Limits
-        if np.max(y) == np.min(y):
-            # Fallback for a perfectly flat signal
-            self.power_array = np.full_like(y, 600) 
-        else:
-            y_norm = (y - np.min(y)) / (np.max(y) - np.min(y))
-            self.power_array = self._rescale(y_norm, min_power, max_power)
-
+        # 4. Hardware Safety Clipping (Does not stretch/distort the wave)
+        self.power_array = np.clip(y, min_power, max_power)
+        
     def get_power_at_time(self, t):
         """
         Fetches the power at a specific scalar time 't' using linear interpolation.
