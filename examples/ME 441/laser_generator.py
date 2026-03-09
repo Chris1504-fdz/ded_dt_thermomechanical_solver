@@ -29,9 +29,9 @@ class LaserProfileGenerator:
         # Unpack params
         n, freq, amplitude, phase, trend, seasonality, frequency_slope, amplitude_slope, phase_slope, seasonality_freq = params
         
-        # 1. Map to continuous physical constraints
-        # Smooth exponential decay for Fourier terms is much better for BO than an int cutoff
-        decay_rate = self._rescale(n, 0.5, 3.0) 
+        # 1. Map to physical constraints
+        # We MUST cast 'n' to an integer so the range() function doesn't crash
+        n_int = int(np.round(self._rescale(n, 0, 10)))
         
         freq = self._rescale(freq, 0.1, 10.0)
         amplitude_watts = self._rescale(amplitude, 0, 150) # Actual physical Watts!
@@ -45,31 +45,31 @@ class LaserProfileGenerator:
         phase_slope = self._rescale(phase_slope, -1.0, 1.0)
         seasonality_freq = self._rescale(seasonality_freq, 0.5, 5.0)
 
-        # 2. Base Fourier Series (Continuous, no integer dead-zones)
+        # 2. Base Fourier Series (Original discrete formulation)
         sum_val = np.zeros_like(x_norm)
-        num_terms = 5 # Fixed number of terms, but their power decays based on 'n' parameter
-        for i in range(1, num_terms * 2, 2):
-            # 'decay_rate' smoothly controls how much high-frequency noise is in the signal
-            term_weight = (1 / (i ** decay_rate)) 
+        # Added +1 so if n_int=5, it actually includes the 5th harmonic (1, 3, 5)
+        for i in range(1, n_int + 1, 2):
+            term_weight = 1 / i
             term = term_weight * np.sin(2 * np.pi * (freq + i * frequency_slope) * i * x_norm + (phase + i * phase_slope))
             sum_val += term
 
+        baseline_power = (self._rescale(0.5, min_power, max_power)) 
+        
         # 3. Assemble Physical Profile
-        # Center the baseline exactly in the middle of your safe zone (550W)
-        baseline_power = 550.0 
-        
-        # Scale the normalized sum exactly to the requested amplitude in Watts
         if np.max(sum_val) != np.min(sum_val):
-            sum_val = sum_val / np.max(np.abs(sum_val)) # Normalize to [-1, 1]
+            sum_val = sum_val / np.max(np.abs(sum_val)) 
             
-        y = baseline_power + (sum_val * (amplitude_watts + (x_norm * amplitude_slope * 50)))
+        envelope = amplitude_watts + (x_norm * amplitude_slope * 50)
+        envelope = np.maximum(envelope, 0.0)    
+        y = baseline_power + (sum_val * envelope) 
         
-        # Add Trend and Seasonality in absolute Watts
+        # 4. Add Macroscopic Drifts
         y += trend_watts * x_norm
         y += seasonality_watts * np.sin(2 * np.pi * seasonality_freq * x_norm)
 
-        # 4. Hardware Safety Clipping (Does not stretch/distort the wave)
-        self.power_array = np.clip(y, min_power, max_power)
+        # 5. Hardware Constraint Squashing
+        y = baseline_power + (max_power - baseline_power) * np.tanh((y - baseline_power) / (max_power - baseline_power))
+        self.power_array = y
         
     def get_power_at_time(self, t):
         """
