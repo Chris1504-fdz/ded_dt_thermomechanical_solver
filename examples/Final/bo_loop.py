@@ -5,7 +5,10 @@ import concurrent.futures
 import multiprocessing
 import warnings
 import logging
+import glob
+import re
 from scipy.stats import qmc
+import gpytorch
 
 # BoTorch Imports
 from botorch.models import ModelListGP, SingleTaskGP
@@ -15,9 +18,11 @@ from botorch.fit import fit_gpytorch_mll
 from gpytorch.mlls import SumMarginalLogLikelihood
 from botorch.utils.multi_objective.box_decompositions.non_dominated import NondominatedPartitioning
 from botorch.acquisition.multi_objective.logei import qLogExpectedHypervolumeImprovement
-from botorch.acquisition.multi_objective.objective import IdentityMCMultiOutputObjective
+from botorch.acquisition.multi_objective.objective import GenericMCMultiOutputObjective
 from botorch.optim.optimize import optimize_acqf_mixed  
 from botorch.exceptions.warnings import InputDataWarning
+from gpytorch.kernels import RBFKernel, ScaleKernel
+
 
 # Suppress the zero-variance warning that floods the terminal during early iterations
 warnings.filterwarnings("ignore", category=InputDataWarning)
@@ -82,20 +87,17 @@ def isolated_simulation_worker(task_index, global_eval_id, params_np):
         max_warpage = 9999.0 + jitter
         max_peeq = 9999.0 + jitter
         
-    # Return 6 elements. Indices 0-3 are your optimization targets. 
-    # Indices 4 and 5 are your passive logging metrics.
     return [-avg_stress, avg_ht, min_ht, max_stress, max_warpage, max_peeq]
 
 def generate_initial_data(num_samples):
     logger.info(f"\n--- GENERATING INITIAL DATASET ({num_samples} SAMPLES) ---")
-    sampler = qmc.LatinHypercube(d=NUM_PARAMS, optimization="random-cd")
+    sampler = qmc.LatinHypercube(d=NUM_PARAMS, optimization="random-cd") 
     init_X_np = sampler.random(n=num_samples)
     
-    init_X_np[:, 0] = np.round(init_X_np[:, 0] * 10) / 10.0
+    init_X_np[:, 0] = np.round(init_X_np[:, 0] * 10) / 10.0 
     
     results = [None] * num_samples
     
-    # Process in strict blocks to prevent asynchronous GPU context collisions
     for batch_start in range(0, num_samples, BATCH_SIZE):
         batch_end = min(batch_start + BATCH_SIZE, num_samples)
         current_batch_size = batch_end - batch_start
@@ -121,65 +123,86 @@ def generate_initial_data(num_samples):
     return torch.tensor(init_X_np, dtype=torch.float64), torch.tensor(results, dtype=torch.float64)
 
 def run_optimization(train_X, train_Y, train_acq_vals, total_iterations=20):
-    bounds = torch.tensor([[0.0] * NUM_PARAMS, [1.0] * NUM_PARAMS], dtype=torch.float64)
+    # --- GPU 0 ROUTING ---
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Executing Bayesian Optimization Math on: {device}")
     
-    S_MAX = 320.0
-    T_min = 0.05
+    # Push historical data and static bounds to the GPU
+    train_X = train_X.to(device=device, dtype=torch.float64)
+    train_Y = train_Y.to(device=device, dtype=torch.float64)
+    if train_acq_vals.nelement() > 0:
+        train_acq_vals = train_acq_vals.to(device=device)
+        
+    bounds = torch.tensor([[0.0] * NUM_PARAMS, [1.0] * NUM_PARAMS], dtype=torch.float64, device=device)
+    SCALED_REF_POINT = torch.tensor([-0.05, -0.05], dtype=torch.float64, device=device)
     
-    constraints = [
-        lambda Z: Z[..., 3] - S_MAX,  # Max stress constraint: <= 0
-        lambda Z: T_min - Z[..., 2]   # Minimum temperature constraint: <= 0
-    ]
+    STRICT_S_MAX = 320.0
+    STRICT_T_MIN = 0.05
     
-    start_iter = len(train_X) // BATCH_SIZE
+    EXPLORE_S_MAX = STRICT_S_MAX * 1.02
+    EXPLORE_T_MIN = STRICT_T_MIN * 0.98
+       
+    bo_batches_run = max(0, (len(train_X) - 51) // BATCH_SIZE)
+    start_iter = bo_batches_run
 
     for iteration in range(start_iter, total_iterations):
         logger.info(f"\n{'='*40}")
         logger.info(f" BO ITERATION {iteration + 1} / {total_iterations}")
         logger.info(f"{'='*40}")
         
-        logger.info("Training GP Models...")
+        logger.info("Training 4 Independent SingleTaskGPs...")
         models = []
         for i in range(4):
-            # 1. SingleTaskGP captures the ordinal nature of parameter 'n'
-
-            models.append(SingleTaskGP(
+            covar = ScaleKernel(RBFKernel(ard_num_dims=NUM_PARAMS))
+            gp = SingleTaskGP(
                 train_X, 
                 train_Y[..., i:i+1], 
-                input_transform=Normalize(d=NUM_PARAMS, bounds=bounds),
-                outcome_transform=Standardize(m=1)
-            ))
-                
+                covar_module=covar, 
+                input_transform=Normalize(d=NUM_PARAMS),
+                outcome_transform=Standardize(m=1) 
+            )
+            models.append(gp)
+            
         model = ModelListGP(*models)
         mll = SumMarginalLogLikelihood(model.likelihood, model)
         
-        # RESILIENCE: Wrap GPyTorch fit in case of numerical instability 
         try:
-            fit_gpytorch_mll(mll)
+            with gpytorch.settings.cholesky_jitter(1e-6):
+                fit_gpytorch_mll(mll)  
         except Exception as e:
-            logger.error(f"GP Fitting Failed: {e}. Attempting to continue with untrained hyperparameters.")
+            logger.error(f"GP Fitting Failed: {e}. Attempting to continue.")
+
+        constraints = [
+            lambda Z: Z[..., 3] - EXPLORE_S_MAX, 
+            lambda Z: EXPLORE_T_MIN - Z[..., 2]   
+        ]
+
+        Y_obj_all = train_Y[..., 0:2]
+        Y_min = Y_obj_all.min(dim=0).values
+        Y_max = Y_obj_all.max(dim=0).values
+        Y_range = (Y_max - Y_min).clamp(min=1e-6)
         
-        c1_hist = T_min - train_Y[..., 2] 
-        c2_hist = train_Y[..., 3] - S_MAX
+        def scaled_objective(Z, X=None):
+            return (Z[..., 0:2] - Y_min) / Y_range
+        
+        c1_hist = STRICT_T_MIN - train_Y[..., 2] 
+        c2_hist = train_Y[..., 3] - STRICT_S_MAX
         is_feasible = (c2_hist <= 0.0) & (c1_hist <= 0.0)
         
         feasible_Y = train_Y[is_feasible]
-        
         if feasible_Y.shape[0] > 0:
-            obj_Y_feasible = feasible_Y[..., 0:2]
-            ref_point = obj_Y_feasible.min(dim=0).values - (obj_Y_feasible.min(dim=0).values.abs() * 0.1)
+            scaled_Y_feasible = (feasible_Y[..., 0:2] - Y_min) / Y_range
         else:
-            obj_Y_feasible = torch.empty((0, 2), dtype=torch.float64)
-            ref_point = torch.tensor([-1500.0, 0.0], dtype=torch.float64)
-            
-        partitioning = NondominatedPartitioning(ref_point=ref_point, Y=obj_Y_feasible)
+            scaled_Y_feasible = torch.empty((0, 2), dtype=torch.float64, device=device) # Initialized on device
+
+        partitioning = NondominatedPartitioning(ref_point=SCALED_REF_POINT, Y=scaled_Y_feasible)
         
         acq_func = qLogExpectedHypervolumeImprovement(
             model=model,
-            ref_point=ref_point,
+            ref_point=SCALED_REF_POINT,
             partitioning=partitioning,
             constraints=constraints,
-            objective=IdentityMCMultiOutputObjective(outcomes=[0, 1])
+            objective=GenericMCMultiOutputObjective(scaled_objective)
         )
         
         logger.info(f"Solving Mixed Acquisition Function for {BATCH_SIZE} candidates...")
@@ -191,8 +214,8 @@ def run_optimization(train_X, train_Y, train_acq_vals, total_iterations=20):
             acq_function=acq_func, 
             bounds=bounds, 
             q=BATCH_SIZE, 
-            num_restarts=10, 
-            raw_samples=512,
+            num_restarts=40, 
+            raw_samples=2**12,
             fixed_features_list=fixed_features_list
         )
         
@@ -200,7 +223,9 @@ def run_optimization(train_X, train_Y, train_acq_vals, total_iterations=20):
         logger.info(f"Dispatching physics simulations to GPUs...")
         
         new_results = [None] * BATCH_SIZE
-        candidates_np = candidates.detach().numpy()
+        
+        # --- PULL TO CPU FOR MULTIPROCESSING ---
+        candidates_np = candidates.detach().cpu().numpy()
         
         with concurrent.futures.ProcessPoolExecutor(max_workers=BATCH_SIZE) as executor:
             future_to_idx = {}
@@ -215,13 +240,13 @@ def run_optimization(train_X, train_Y, train_acq_vals, total_iterations=20):
                     new_results[idx] = future.result()
                     logger.info(f"  [+] BO Task {idx:02d} (GPU {GPU_MAPPING[idx]}) finished.")
                 except Exception as pool_error:
-                    # RESILIENCE: Catch OS-level process terminations (OOM, Segfaults) during BO
                     logger.error(f"  [!] FATAL POOL CRASH on Task {idx:02d}: {pool_error}")
                     jitter = np.random.uniform(0, 1e-3)
                     new_results[idx] = [-1500.0 - jitter, 0.0 + jitter, 0.0 + jitter, 2000.0 + jitter, 9999.0 + jitter, 9999.0 + jitter]
 
-        new_Y = torch.tensor(new_results, dtype=torch.float64)
-        train_X = torch.cat([train_X, candidates])
+        # --- PUSH NEW RESULTS TO GPU 0 ---
+        new_Y = torch.tensor(new_results, dtype=torch.float64, device=device)
+        train_X = torch.cat([train_X, candidates]) # Candidates is already on GPU 0
         train_Y = torch.cat([train_Y, new_Y])
         
         if train_acq_vals.dim() == 0 or train_acq_vals.nelement() == 0:
@@ -229,23 +254,20 @@ def run_optimization(train_X, train_Y, train_acq_vals, total_iterations=20):
         else:
             train_acq_vals = torch.cat([train_acq_vals, acq_value.unsqueeze(0)])
         
+        # --- PULL TO CPU FOR SAFE SAVING ---
         torch.save({
-            'train_X': train_X, 
-            'train_Y': train_Y,
-            'train_acq_vals': train_acq_vals
+            'train_X': train_X.cpu(), 
+            'train_Y': train_Y.cpu(),
+            'train_acq_vals': train_acq_vals.cpu()
         }, f"bo_checkpoint_iter_{iteration+1}.pt")
         
         logger.info(f"Iteration complete. Data saved.")
 
     return train_X, train_Y
 
-import glob
-import re
-
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn', force=True)
     
-    # Dynamically find the latest checkpoint file
     checkpoint_files = glob.glob("bo_checkpoint_iter_*.pt")
     latest_checkpoint = None
     max_iter = -1
@@ -267,11 +289,9 @@ if __name__ == '__main__':
         logger.info(f"Loaded {len(init_X)} previous evaluations.")
     else:
         logger.info(f"\n--- NO CHECKPOINT FOUND. COLD STARTING ---")
-        # Request 15 Optimal LHS Samples
         init_X, init_Y = generate_initial_data(num_samples=51)
         init_acq = torch.empty(0) 
         
-        # Save immediately so the 15 LHS runs are not lost if BO Iteration 1 crashes
         torch.save({
             'train_X': init_X, 
             'train_Y': init_Y,

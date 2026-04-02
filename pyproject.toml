@@ -19,6 +19,7 @@ classifiers = [
 dependencies = [
     "botorch>=0.16.1",
     "cupy-cuda12x>=14.0.0",
+    "gpytorch>=1.15.1",
     "ipykernel>=7.2.0",
     "numba>=0.63.1",
     "pandas>=2.3.3",

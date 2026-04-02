@@ -6,7 +6,7 @@ import multiprocessing
 import warnings
 import logging
 from scipy.stats import qmc
-
+import gpytorch
 # BoTorch Imports
 from botorch.models import ModelListGP, SingleTaskGP
 from botorch.models.transforms.outcome import Standardize
@@ -15,9 +15,12 @@ from botorch.fit import fit_gpytorch_mll
 from gpytorch.mlls import SumMarginalLogLikelihood
 from botorch.utils.multi_objective.box_decompositions.non_dominated import NondominatedPartitioning
 from botorch.acquisition.multi_objective.logei import qLogExpectedHypervolumeImprovement
-from botorch.acquisition.multi_objective.objective import IdentityMCMultiOutputObjective
+from botorch.acquisition.multi_objective.objective import GenericMCMultiOutputObjective
 from botorch.optim.optimize import optimize_acqf_mixed  
 from botorch.exceptions.warnings import InputDataWarning
+from gpytorch.kernels import RBFKernel, ScaleKernel
+from botorch.models import KroneckerMultiTaskGP
+
 
 # Suppress the zero-variance warning that floods the terminal during early iterations
 warnings.filterwarnings("ignore", category=InputDataWarning)
@@ -88,10 +91,10 @@ def isolated_simulation_worker(task_index, global_eval_id, params_np):
 
 def generate_initial_data(num_samples):
     logger.info(f"\n--- GENERATING INITIAL DATASET ({num_samples} SAMPLES) ---")
-    sampler = qmc.LatinHypercube(d=NUM_PARAMS, optimization="random-cd")
+    sampler = qmc.LatinHypercube(d=NUM_PARAMS, optimization="random-cd") #OLHS
     init_X_np = sampler.random(n=num_samples)
     
-    init_X_np[:, 0] = np.round(init_X_np[:, 0] * 10) / 10.0
+    init_X_np[:, 0] = np.round(init_X_np[:, 0] * 10) / 10.0 # Make it discrete in the first dimension (number of fourier modes)
     
     results = [None] * num_samples
     
@@ -127,11 +130,12 @@ def run_optimization(train_X, train_Y, train_acq_vals, total_iterations=20):
     T_min = 0.05
     
     constraints = [
-        lambda Z: Z[..., 3] - S_MAX,  # Max stress constraint: <= 0
-        lambda Z: T_min - Z[..., 2]   # Minimum temperature constraint: <= 0
+        lambda Z: Z[..., 3] - S_MAX * 1.02,  # Max stress constraint: <= 0
+        lambda Z: T_min * 0.98 - Z[..., 2]   # Minimum temperature constraint: <= 0
     ]
-    
-    start_iter = len(train_X) // BATCH_SIZE
+    SCALED_REF_POINT = torch.tensor([-0.05, -0.05], dtype=torch.float64)
+       
+    start_iter = len(train_X) // BATCH_SIZE 
 
     for iteration in range(start_iter, total_iterations):
         logger.info(f"\n{'='*40}")
@@ -139,47 +143,47 @@ def run_optimization(train_X, train_Y, train_acq_vals, total_iterations=20):
         logger.info(f"{'='*40}")
         
         logger.info("Training GP Models...")
-        models = []
-        for i in range(4):
-            # 1. SingleTaskGP captures the ordinal nature of parameter 'n'
+        stress_rbf = ScaleKernel(RBFKernel(ard_num_dims=NUM_PARAMS))
+        thermal_rbf = ScaleKernel(RBFKernel(ard_num_dims=NUM_PARAMS))
 
-            models.append(SingleTaskGP(
-                train_X, 
-                train_Y[..., i:i+1], 
-                input_transform=Normalize(d=NUM_PARAMS, bounds=bounds),
-                outcome_transform=Standardize(m=1)
-            ))
-                
-        model = ModelListGP(*models)
+        Stress_Data = train_Y[...,[0, 3]]
+        stress_gp = KroneckerMultiTaskGP(train_X, Stress_Data, data_covar_module=stress_rbf, outcome_transform=Standardize(m=2), input_transform=Normalize(d=NUM_PARAMS))
+
+        Thermal_Data = train_Y[...,[1, 2]]
+        thermal_gp = KroneckerMultiTaskGP(train_X, Thermal_Data, data_covar_module=thermal_rbf, outcome_transform=Standardize(m=2), input_transform=Normalize(d=NUM_PARAMS))
+        model = ModelListGP(stress_gp, thermal_gp)
         mll = SumMarginalLogLikelihood(model.likelihood, model)
         
-        # RESILIENCE: Wrap GPyTorch fit in case of numerical instability 
         try:
-            fit_gpytorch_mll(mll)
+            with gpytorch.settings.cholesky_jitter(1e-6):
+                fit_gpytorch_mll(mll)  
         except Exception as e:
             logger.error(f"GP Fitting Failed: {e}. Attempting to continue with untrained hyperparameters.")
+        Y_obj_all = train_Y[..., 0:2]
+        Y_min = Y_obj_all.min(dim=0).values
+        Y_max = Y_obj_all.max(dim=0).values
+        Y_range = (Y_max - Y_min).clamp(min=1e-6)
+        def scaled_objective(Z, X=None):
+            return (Z[..., 0:2] - Y_min) / Y_range
         
         c1_hist = T_min - train_Y[..., 2] 
         c2_hist = train_Y[..., 3] - S_MAX
         is_feasible = (c2_hist <= 0.0) & (c1_hist <= 0.0)
         
         feasible_Y = train_Y[is_feasible]
-        
         if feasible_Y.shape[0] > 0:
-            obj_Y_feasible = feasible_Y[..., 0:2]
-            ref_point = obj_Y_feasible.min(dim=0).values - (obj_Y_feasible.min(dim=0).values.abs() * 0.1)
+            scaled_Y_feasible = scaled_objective(feasible_Y)
         else:
-            obj_Y_feasible = torch.empty((0, 2), dtype=torch.float64)
-            ref_point = torch.tensor([-1500.0, 0.0], dtype=torch.float64)
-            
-        partitioning = NondominatedPartitioning(ref_point=ref_point, Y=obj_Y_feasible)
+            scaled_Y_feasible = torch.empty((0, 2), dtype=torch.float64)
+
+        partitioning = NondominatedPartitioning(ref_point=SCALED_REF_POINT, Y=scaled_Y_feasible)
         
         acq_func = qLogExpectedHypervolumeImprovement(
             model=model,
-            ref_point=ref_point,
+            ref_point=SCALED_REF_POINT,
             partitioning=partitioning,
             constraints=constraints,
-            objective=IdentityMCMultiOutputObjective(outcomes=[0, 1])
+            objective=GenericMCMultiOutputObjective(scaled_objective)
         )
         
         logger.info(f"Solving Mixed Acquisition Function for {BATCH_SIZE} candidates...")
@@ -191,8 +195,8 @@ def run_optimization(train_X, train_Y, train_acq_vals, total_iterations=20):
             acq_function=acq_func, 
             bounds=bounds, 
             q=BATCH_SIZE, 
-            num_restarts=10, 
-            raw_samples=512,
+            num_restarts=40, 
+            raw_samples=2**12,
             fixed_features_list=fixed_features_list
         )
         
